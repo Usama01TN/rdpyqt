@@ -8,3 +8,4 @@ dist/*
 build/*
 rdpy.egg-info/*
 *.c
+*.sh
