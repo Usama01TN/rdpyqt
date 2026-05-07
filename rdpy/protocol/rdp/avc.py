@@ -36,6 +36,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import numpy as np
 import rdpy.core.log as log
 
@@ -600,9 +601,9 @@ def _open_sw_decoder():
     ctx = av.codec.CodecContext.create(codec)
     ctx.thread_count = min(os.cpu_count() or 1, 4)
     ctx.thread_type = 2  # SLICE — no reorder delay, parallelises within frame
-    ctx.options = {'flags': '+low_delay', 'flags2': '+fast'}
+    ctx.options = {'flags': '+low_delay', 'flags2': '+fast', 'refs': '1'}
     ctx.open()
-    log.debug("AVC: using software H.264 decoder (thread_count=%d, SLICE, low_delay)" %
+    log.debug("AVC: using software H.264 decoder (thread_count=%d, SLICE, low_delay, refs=1)" %
               ctx.thread_count)
     return ctx
 
@@ -618,6 +619,7 @@ class AvcDecoder:
         self._hw_name = None
         self._decode_count = 0
         self._null_count = 0
+        self._last_receive_time = 0.0  # monotonic time of most recent _decode_h264 call
         # SPS/PPS recovery state
         self._sps_nal = b''          # cached SPS NAL (Annex B, with start code)
         self._pps_nal = b''          # cached PPS NAL (Annex B, with start code)
@@ -625,6 +627,7 @@ class AvcDecoder:
         self._hw_reset_count = 0       # total hard resets
         self._needs_keyframe = False   # True after reset/error; skips non-IDR frames until IDR
         self._keyframe_wait_count = 0  # non-IDR frames dropped while waiting for IDR
+        self._keyframe_wait_start = 0.0  # monotonic time when IDR-wait began
         self._prepend_sps_next_idr = False  # inject SPS+PPS before next IDR
         self.on_hard_reset = None    # callback() invoked after each hard reset
         # AVC444 LC=2 chroma-upgrade support
@@ -696,6 +699,33 @@ class AvcDecoder:
         if self._dec2 is not None:
             self._dec2.flush()
 
+    def request_keyframe(self):
+        """Enter IDR-wait state without flushing the codec context.
+
+        Called by the RDPGFX stall handler (_onAvcNoOutput) after detecting
+        that the decoder has been producing no output for too long.
+
+        Sets _needs_keyframe=True so subsequent P-frames are silently dropped
+        (mirroring grdp's needsKeyFrame pattern) while we wait for the IDR
+        the server will send in response to our ForceRefresh request.
+
+        No flush_buffers() is called: the VideoToolbox codec context
+        (SPS/PPS, reference frames) is preserved intact so that when the
+        IDR arrives it is decoded naturally.  If VideoToolbox still returns
+        null for the IDR, the existing flush+retry path in _decode_h264
+        handles it — IDR frames are self-contained, so that flush is safe.
+
+        Without this call the decoder would keep feeding P-frames into
+        stalled VideoToolbox (wasted CPU, risk of cascading errors) for
+        the entire 15-second refresh cooldown before the next IDR request
+        is sent.  Mirrors grdp's post-stall needsKeyFrame=true pattern.
+        """
+        self._needs_keyframe = True
+        self._keyframe_wait_count = 0
+        self._keyframe_wait_start = 0.0
+        if self._dec2 is not None:
+            self._dec2.request_keyframe()
+
     def _parse_and_cache_nals(self, h264_data):
         """Single-pass NAL unit scanner: return NAL type list and update SPS/PPS cache.
 
@@ -765,7 +795,7 @@ class AvcDecoder:
         to avoid an infinite reset loop if hardware acceleration is broken.
         """
         self._hw_reset_count += 1
-        log.warning("AVC: hard reset #%d (%s, recreating decoder)"
+        log.debug("AVC: hard reset #%d (%s, recreating decoder)"
                     % (self._hw_reset_count, reason))
         self._ctx = None
         self._hw_error_count = 0
@@ -775,6 +805,7 @@ class AvcDecoder:
         # Always try hardware decoder; only fall back to software if unavailable.
         self._needs_keyframe = True
         self._keyframe_wait_count = 0
+        self._keyframe_wait_start = 0.0
         ctx, hw_name = _try_open_hw_decoder()
         if ctx is not None:
             self._ctx = ctx
@@ -793,6 +824,15 @@ class AvcDecoder:
         # so any arriving P-frames will fail until the server sends an IDR.
         if self.on_hard_reset is not None:
             self.on_hard_reset()
+
+    def soft_reset(self):
+        """Public entry point for an externally-triggered decoder reset.
+
+        Equivalent to _hard_reset() but named to mirror grdp's soft-reset
+        pattern where the RDPGFX layer resets the decoder context on stall
+        detection (rather than waiting for the internal 900-frame/15 s limit).
+        """
+        self._hard_reset(reason='soft reset (stall)')
 
     # -----------------------------------------------------------------
     # AVC420 bitmap stream (MS-RDPEGFX 2.2.4.4)
@@ -989,6 +1029,10 @@ class AvcDecoder:
         """Lazy-initialize the auxiliary H.264 decoder for stream2."""
         if self._dec2 is None:
             self._dec2 = AvcDecoder()
+            # Propagate aux decoder hard-resets to the parent's on_hard_reset callback
+            # so that ForceRefresh is sent whenever the chroma decoder times out.
+            # Use a lambda so it always picks up the current value of self.on_hard_reset.
+            self._dec2.on_hard_reset = lambda: self.on_hard_reset() if self.on_hard_reset else None
             log.debug("AVC444: auxiliary decoder initialized")
         return self._dec2
 
@@ -1081,6 +1125,7 @@ class AvcDecoder:
             return None
 
         self._decode_count += 1
+        self._last_receive_time = time.monotonic()
 
         # Single-pass: collect NAL types and update SPS/PPS cache if changed
         nal_types = self._parse_and_cache_nals(h264_data)
@@ -1097,14 +1142,21 @@ class AvcDecoder:
         # While waiting for an IDR (after reset or error), drop non-IDR frames
         # without decode attempts.  This prevents cascading InvalidDataError
         # from P-frames that the decoder cannot handle without a reference frame.
-        # Mirrors grdp's needsKeyFrame / keyframeWaitLimit pattern.
+        # Mirrors grdp's needsKeyFrame / keyframeWaitLimit / keyframeWaitTimeout pattern.
         if self._needs_keyframe and not has_idr:
             self._keyframe_wait_count += 1
+            if self._keyframe_wait_count == 1:
+                self._keyframe_wait_start = time.monotonic()
             if self._keyframe_wait_count == 1 or self._keyframe_wait_count % 30 == 0:
                 log.debug("AVC: decode #%d waiting for IDR (skipped %d non-IDR frames)" %
                           (self._decode_count, self._keyframe_wait_count))
-            if self._keyframe_wait_count >= self._KEYFRAME_WAIT_LIMIT:
-                self._hard_reset(reason='keyframe wait limit (%d)' % self._KEYFRAME_WAIT_LIMIT)
+            waited_too_long = (self._keyframe_wait_start > 0 and
+                               time.monotonic() - self._keyframe_wait_start >= self._KEYFRAME_WAIT_TIMEOUT)
+            if self._keyframe_wait_count >= self._KEYFRAME_WAIT_LIMIT or waited_too_long:
+                reason = ('keyframe wait timeout (%.1fs)' % self._KEYFRAME_WAIT_TIMEOUT
+                          if waited_too_long
+                          else 'keyframe wait limit (%d)' % self._KEYFRAME_WAIT_LIMIT)
+                self._hard_reset(reason=reason)
             return None
 
         # After a hard reset the fresh decoder has no SPS context.  Inject our
@@ -1148,6 +1200,7 @@ class AvcDecoder:
                 self._hw_error_count = 0
                 self._needs_keyframe = False
                 self._keyframe_wait_count = 0
+                self._keyframe_wait_start = 0.0
                 self._prepend_sps_next_idr = False
                 if self._decode_count <= 3:
                     log.debug("AVC: decode #%d OK frame=%dx%d fmt=%s h264Len=%d" %
@@ -1169,6 +1222,7 @@ class AvcDecoder:
             self._ctx.flush_buffers()
             self._needs_keyframe = True
             self._keyframe_wait_count = 0
+            self._keyframe_wait_start = 0.0
         except Exception as e:
             log.warning("AVC: H.264 decode error: %s" % e)
             if has_idr and packet is not None:
@@ -1181,6 +1235,7 @@ class AvcDecoder:
             self._ctx.flush_buffers()
             self._needs_keyframe = True
             self._keyframe_wait_count = 0
+            self._keyframe_wait_start = 0.0
             self._hw_error_count += 1
             if self._hw_error_count >= self._HW_ERROR_THRESHOLD:
                 self._hard_reset()
@@ -1189,6 +1244,17 @@ class AvcDecoder:
 
     _HW_ERROR_THRESHOLD = 5    # consecutive AVERROR_UNKNOWN errors before hard reset
     _KEYFRAME_WAIT_LIMIT = 900  # non-IDR frames dropped before giving up and hard-resetting
+    _KEYFRAME_WAIT_TIMEOUT = 15.0  # seconds in IDR-wait before hard-resetting (mirrors grdp)
+
+    @property
+    def last_receive_time(self):
+        """Monotonic time of the most recent _decode_h264() call, or 0.0 if never called.
+
+        Used by the RDPGFX stall handler to distinguish a genuinely idle server
+        (no packets arriving) from a HW decoder stall (packets arriving but no
+        decoded frames produced).  Mirrors grdp's LastReceiveTime() interface.
+        """
+        return self._last_receive_time
 
     @property
     def needs_keyframe(self):
@@ -1222,6 +1288,7 @@ class AvcDecoder:
                 self._hw_error_count = 0
                 self._needs_keyframe = False
                 self._keyframe_wait_count = 0
+                self._keyframe_wait_start = 0.0
                 self._prepend_sps_next_idr = False
                 log.debug("AVC: decode #%d IDR recovery after flush OK %dx%d" %
                           (self._decode_count, result.width, result.height))

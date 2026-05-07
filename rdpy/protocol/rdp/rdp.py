@@ -233,6 +233,15 @@ class RDPClientController(pdu.layer.PDUClientListener):
             self._x224Layer._requestedProtocol = x224.Protocols.PROTOCOL_SSL
         elif level == SecurityLevel.RDP_LEVEL_NLA:
             self._x224Layer._requestedProtocol = x224.Protocols.PROTOCOL_SSL | x224.Protocols.PROTOCOL_HYBRID
+
+    def setDecoderBrokenCallback(self, callback):
+        """Set callback invoked when the H.264 decoder cannot recover.
+
+        When the decoder hard-resets but the server still does not send an IDR
+        within the reconnect timeout, this callback is fired.  The application
+        layer should trigger a full RDP reconnect in response.
+        """
+        self._drdynvcLayer.setDecoderBrokenCallback(callback)
         
     def addClientObserver(self, observer):
         """

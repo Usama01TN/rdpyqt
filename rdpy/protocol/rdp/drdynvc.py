@@ -173,6 +173,12 @@ class DrdynvcLayer(LayerAutomata):
         self._avcLastSuccessTime = 0.0   # monotonic; 0 = no success yet this session
         self._avcLastRefreshTime = 0.0   # monotonic; time of last full freeze refresh request
         self._avcKeyframeRequestTime = 0.0  # monotonic; time of last keyframe-wait IDR request
+        self._avcHardResetTime = 0.0     # monotonic; time of FIRST AVC hard reset (0 = none)
+        self._avcDecoderBrokenNotified = False  # True once reconnect callback has been fired
+        self._avcSoftResetCount = 0      # soft resets attempted since last successful decode
+        self._lastLC2RecvTime = 0.0      # monotonic; time of most recent LC=2 frame arrival
+        self._auxDecoderBrokenTime = 0.0 # monotonic; when LC=2 aux decoder first went stuck (0=ok)
+        self._decoderBrokenCallback = None
         # Bitmap cache: cacheSlot -> (width, height, bytearray BGRA data)
         self._gfxCache = {}
         # ClearCodec VBAR caches (persistent across decode calls, matching grdp)
@@ -223,6 +229,15 @@ class DrdynvcLayer(LayerAutomata):
         indicating the decoder is stuck waiting for an IDR key frame.
         """
         self._requestRefreshCallback = callback
+
+    def setDecoderBrokenCallback(self, callback):
+        """Set callback invoked when the H.264 decoder is permanently broken.
+
+        Called when the decoder has been hard-reset but the server still has
+        not sent an IDR within _AVC_RECONNECT_TIMEOUT seconds.  The callback
+        should trigger a full RDP reconnect to restore video playback.
+        """
+        self._decoderBrokenCallback = callback
 
     def connect(self):
         log.debug("DrdynvcLayer.connect()")
@@ -678,6 +693,11 @@ class DrdynvcLayer(LayerAutomata):
         # Reset AVC freeze-recovery timing (fresh start after graphics reset)
         self._avcLastSuccessTime = 0.0
         self._avcLastRefreshTime = 0.0
+        self._avcHardResetTime = 0.0
+        self._avcDecoderBrokenNotified = False
+        self._avcSoftResetCount = 0
+        self._lastLC2RecvTime = 0.0
+        self._auxDecoderBrokenTime = 0.0
         # Do NOT reset _totalFramesDecoded here — the server's frame IDs
         # continue across RESET_GRAPHICS, so our cumulative count must too.
         # FreeRDP only resets on CAPS_CONFIRM, not RESET_GRAPHICS.
@@ -914,21 +934,49 @@ class DrdynvcLayer(LayerAutomata):
                 return None
         return self._avcDecoder
 
+    # Soft-reset limit before escalating to a full reconnect.
+    # Mirrors grdp's softResetLimit=5.
+    _AVC_SOFT_RESET_LIMIT = 5
+
     def _onAvcHardReset(self):
         """Called by AvcDecoder immediately after a hard reset.
 
-        Hard resets now only happen via the _KEYFRAME_WAIT_LIMIT path (after
-        waiting too long for an IDR following an InvalidDataError).  We request
-        a full-screen refresh to prompt the server for an IDR.
+        Idempotent: only the *first* hard reset starts the reconnect countdown.
+        Subsequent resets (e.g. aux decoder resetting shortly after the main
+        decoder reset) do NOT restart the clock — mirrors grdp's
+        startAuxDecoderBrokenTimer() which is a no-op when already running.
+
+        After _AVC_SOFT_RESET_LIMIT resets without a successful decode,
+        triggers an immediate reconnect — mirrors grdp's maybeNotifyDecoderBroken
+        escalating after softResetLimit soft resets.
         """
-        log.debug("RDPGFX: AVC hard reset — requesting immediate server refresh")
+        self._avcSoftResetCount += 1
+        log.debug("RDPGFX: AVC soft reset #%d/%d — requesting immediate server refresh"
+                  % (self._avcSoftResetCount, self._AVC_SOFT_RESET_LIMIT))
         self._avcLastRefreshTime = 0.0   # clear cooldown so request goes through
+        if self._avcHardResetTime == 0.0:
+            # Start the reconnect countdown from the FIRST hard reset only.
+            self._avcHardResetTime = time.monotonic()
+
+        # After reaching the soft-reset limit, reconnect immediately rather
+        # than waiting for _AVC_RECONNECT_TIMEOUT.  Mirrors grdp escalating
+        # from soft-reset to onDecoderBroken after softResetLimit attempts.
+        if self._avcSoftResetCount >= self._AVC_SOFT_RESET_LIMIT and not self._avcDecoderBrokenNotified:
+            self._avcDecoderBrokenNotified = True
+            log.warning("RDPGFX: AVC soft reset limit (%d) reached — triggering reconnect"
+                        % self._AVC_SOFT_RESET_LIMIT)
+            if self._decoderBrokenCallback is not None:
+                self._decoderBrokenCallback()
+            return
+
         if self._requestRefreshCallback is not None:
             self._requestRefreshCallback()
             self._avcLastRefreshTime = time.monotonic()
 
     # Seconds of no AVC output before requesting an IDR from the server.
-    _AVC_FREEZE_THRESHOLD = 5.0
+    # 7 s gives the HW decoder (VideoToolbox) enough headroom to process an
+    # IDR/SPS before we declare a stall — mirrors grdp's avcHWReadyFreezeThreshold.
+    _AVC_FREEZE_THRESHOLD = 7.0
     # Minimum seconds between consecutive IDR refresh requests (cooldown).
     _AVC_REFRESH_COOLDOWN = 15.0
     # Also trigger recovery when this many consecutive null frames accumulate
@@ -938,6 +986,9 @@ class DrdynvcLayer(LayerAutomata):
     # (Unused constant kept for reference; fast keyframe-request path was removed
     # because repeated SupressOutputDataPDU calls disconnect some servers.)
     _AVC_KEYFRAME_REQUEST_INTERVAL = 2.0
+    # Seconds after a hard reset before giving up and triggering a full reconnect.
+    # Gives the server time to respond to the post-reset ForceRefresh.
+    _AVC_RECONNECT_TIMEOUT = 10.0
 
     def _renderAvc420(self, surfaceId, left, top, width, height, data):
         """Decode and render AVC420 (H.264 YUV420) bitmap data."""
@@ -950,6 +1001,8 @@ class DrdynvcLayer(LayerAutomata):
                 self._onAvcNoOutput()
                 return
             self._avcLastSuccessTime = time.monotonic()
+            self._avcHardResetTime = 0.0  # decoder recovered; cancel reconnect countdown
+            self._avcSoftResetCount = 0   # reset soft-reset counter on success
             self._blitToSurface(surfaceId, left, top, width, height, bgra_arr)
             ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
             if self._gfxSurfaceCallback is not None:
@@ -967,6 +1020,13 @@ class DrdynvcLayer(LayerAutomata):
 
     def _renderAvc444(self, surfaceId, left, top, width, height, data):
         """Decode and render AVC444/AVC444v2 (H.264 YUV444) bitmap data."""
+        # Record LC=2 arrival unconditionally (even when aux decoder can't decode it).
+        # Used to distinguish an active-LC=2-only server from a truly idle/AVC420 server.
+        # Mirrors grdp's lastLC2RecvTime tracking in decodeAVC444LC2.
+        if len(data) >= 4:
+            _lc = (struct.unpack_from('<I', data, 0)[0] >> 30) & 0x03
+            if _lc == 2:
+                self._lastLC2RecvTime = time.monotonic()
         decoder = self._getAvcDecoder()
         if decoder is None:
             return
@@ -981,8 +1041,35 @@ class DrdynvcLayer(LayerAutomata):
                 # primed or no cached luma).  Do NOT update _avcLastSuccessTime:
                 # the luma decoder may be the source of a freeze, and LC=2
                 # frames arriving independently should not mask it.
+                #
+                # However, if the main decoder is working (recent _avcLastSuccessTime)
+                # but LC=2 keeps returning the sentinel, the aux decoder is stuck in
+                # IDR-wait — the server will never send a fresh stream2 IDR without a
+                # reconnect.  Mirror grdp's auxDecoderBrokenTimer: arm a one-shot
+                # _AVC_RECONNECT_TIMEOUT timer; if LC=2 is still broken when it fires,
+                # trigger a full reconnect.
+                if not self._avcDecoderBrokenNotified and self._avcLastSuccessTime > 0.0:
+                    now = time.monotonic()
+                    if now - self._avcLastSuccessTime < self._AVC_RECONNECT_TIMEOUT:
+                        # Main decoder recently active — aux is the broken one.
+                        if self._auxDecoderBrokenTime == 0.0:
+                            self._auxDecoderBrokenTime = now
+                        elif now - self._auxDecoderBrokenTime >= self._AVC_RECONNECT_TIMEOUT:
+                            self._avcDecoderBrokenNotified = True
+                            log.warning(
+                                "RDPGFX: AVC444 aux decoder stuck %.0fs"
+                                " (server sending LC=2 only) — triggering reconnect"
+                                % (now - self._auxDecoderBrokenTime))
+                            if self._decoderBrokenCallback is not None:
+                                self._decoderBrokenCallback()
+                    else:
+                        # Main decoder also stalled; _onAvcNoOutput handles reconnect.
+                        self._auxDecoderBrokenTime = 0.0
                 return
             self._avcLastSuccessTime = time.monotonic()
+            self._avcHardResetTime = 0.0  # decoder recovered; cancel reconnect countdown
+            self._avcSoftResetCount = 0   # reset soft-reset counter on success
+            self._auxDecoderBrokenTime = 0.0  # aux decoder working; cancel broken timer
             self._blitToSurface(surfaceId, left, top, width, height, bgra_arr)
             ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
             if self._gfxSurfaceCallback is not None:
@@ -1004,28 +1091,55 @@ class DrdynvcLayer(LayerAutomata):
         Two cases:
 
         1. **Keyframe-wait state** (needs_keyframe=True): the decoder is waiting
-           for an IDR after a decode error.  Non-IDR frames are silently dropped
-           by AvcDecoder._decode(); we simply return here.
+           for an IDR after a decode error or stall.  Non-IDR frames are silently
+           dropped by AvcDecoder._decode_h264(); we simply return here.
 
         2. **VideoToolbox null-frame stall** (needs_keyframe=False): the decoder
            is silently returning null for P-frames.  This happens on macOS when
-           VideoToolbox is temporarily overloaded or buffering.  We call
-           decoder.flush() to reset null-frame counters and send ONE IDR request
-           per _AVC_REFRESH_COOLDOWN seconds, then continue feeding frames.
+           VideoToolbox is temporarily overloaded or buffering.  We:
+             a. call decoder.flush() to reset null-frame counters,
+             b. call decoder.request_keyframe() to enter IDR-wait state so
+                P-frames are dropped (mirrors grdp's needsKeyFrame pattern),
+             c. send ONE ForceRefresh IDR request per _AVC_REFRESH_COOLDOWN.
            We do NOT hard-reset the decoder because:
              - Hard reset destroys VideoToolbox's reference-frame chain.
-             - This server never sends an IDR after the initial one (infinite
-               GOP), so a hard-reset decoder will NEVER recover.
              - VideoToolbox null stalls are often transient and self-resolve
                without intervention (confirmed in logs: frames 10–15 stalled
                then resumed on their own).
-             - If an IDR request does cause the server to send an IDR, the
+             - If an IDR request causes the server to send an IDR, the
                decoder — still holding its full codec context — processes it
                naturally without needing recreation.
+           When request_keyframe() is set, _keyframe_wait_count grows until
+           _KEYFRAME_WAIT_LIMIT (900 frames ≈ 30 s) triggers _hard_reset(),
+           which destroys/recreates the decoder and fires on_hard_reset for
+           another ForceRefresh — a full recovery fallback.
         """
-        # While waiting for IDR (after InvalidDataError), frames are silently
-        # dropped — this is not a freeze state, no action needed here.
+        # While waiting for IDR (after InvalidDataError or stall detection),
+        # frames are silently dropped — this is not a new freeze state.
+        # However, the server may not send an IDR unless we keep asking.
+        # Mirrors grdp's pattern: re-send ForceRefresh every
+        # _AVC_KEYFRAME_REQUEST_INTERVAL seconds until an IDR arrives.
         if self._avcDecoder and self._avcDecoder.needs_keyframe:
+            now = time.monotonic()
+            # If a hard reset has fired but the server still hasn't sent an IDR
+            # after _AVC_RECONNECT_TIMEOUT seconds, trigger a full reconnect.
+            # This handles the "server ignores ForceRefresh" deadlock.
+            if (self._avcHardResetTime > 0.0 and
+                    not self._avcDecoderBrokenNotified and
+                    now - self._avcHardResetTime >= self._AVC_RECONNECT_TIMEOUT):
+                self._avcDecoderBrokenNotified = True
+                log.warning("RDPGFX: AVC still frozen %.0fs after hard reset"
+                            " — triggering reconnect (lastLC2=%.1fs ago)"
+                            % (self._AVC_RECONNECT_TIMEOUT,
+                               now - self._lastLC2RecvTime if self._lastLC2RecvTime > 0.0 else -1.0))
+                if self._decoderBrokenCallback is not None:
+                    self._decoderBrokenCallback()
+                return
+            if now - self._avcLastRefreshTime >= self._AVC_KEYFRAME_REQUEST_INTERVAL:
+                self._avcLastRefreshTime = now
+                log.debug("RDPGFX: AVC: still waiting for IDR, re-requesting refresh")
+                if self._requestRefreshCallback is not None:
+                    self._requestRefreshCallback()
             return
 
         if self._avcLastSuccessTime == 0.0:
@@ -1033,6 +1147,14 @@ class DrdynvcLayer(LayerAutomata):
 
         now = time.monotonic()
         frozen_for = now - self._avcLastSuccessTime
+
+        # Don't trigger stall recovery when the server isn't actively sending
+        # video packets — a static screen produces no frames but the decoder is
+        # healthy.  Mirrors grdp's LastReceiveTime() guard in maybeTriggerInputStall.
+        if self._avcDecoder is not None:
+            recv_time = self._avcDecoder.last_receive_time
+            if recv_time == 0.0 or now - recv_time >= self._AVC_FREEZE_THRESHOLD:
+                return
 
         null_count = self._avcDecoder.null_count if self._avcDecoder else 0
         count_triggered = (null_count >= self._AVC_NULL_FRAME_THRESHOLD and
@@ -1047,20 +1169,20 @@ class DrdynvcLayer(LayerAutomata):
 
         trigger_reason = ('time(%.1fs)' % frozen_for if time_triggered
                           else 'count(%d)' % null_count)
-        log.debug("RDPGFX: AVC stall [%s], requesting IDR (decoder context preserved)"
+        log.debug("RDPGFX: AVC stall [%s], soft-resetting decoder and requesting refresh"
                   % trigger_reason)
         self._avcLastRefreshTime = now
 
-        # Reset null-frame counters so freeze detection does not re-fire
-        # immediately.  Intentionally NOT calling _hard_reset(): the decoder
-        # context (VideoToolbox state + reference frames) is preserved so it
-        # can resume decoding when the server eventually sends an IDR or when
-        # VideoToolbox self-recovers.
         if self._avcDecoder is not None:
-            self._avcDecoder.flush()
-
-        if self._requestRefreshCallback is not None:
-            self._requestRefreshCallback()
+            # Soft-reset: destroy and recreate the decoder context immediately.
+            # Mirrors grdp's maybeNotifyDecoderBroken() soft reset path: rather
+            # than waiting 900 frames (~30 s) for the internal hard-reset threshold,
+            # we reset as soon as a stall is detected.  This unsticks VideoToolbox
+            # and gives the server a fresh context to send an IDR into.
+            # soft_reset() internally calls _hard_reset() which fires on_hard_reset
+            # → _onAvcHardReset() → increments _avcSoftResetCount, sets
+            # _avcHardResetTime (idempotent), and issues a ForceRefresh.
+            self._avcDecoder.soft_reset()
 
     def _renderUncompressed(self, surfaceId, left, top, width, height, pixelFormat, data):
         """Render uncompressed XRGB_8888/ARGB_8888 bitmap data."""

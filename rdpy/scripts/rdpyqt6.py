@@ -136,6 +136,7 @@ class RDPClientQtFactory(rdp.ClientFactory):
         self._swap_alt_meta = swap_alt_meta
         self._w = None
         self._resizing = False
+        self._decoderBroken = False
         
     def buildObserver(self, controller, addr):
         """
@@ -165,6 +166,9 @@ class RDPClientQtFactory(rdp.ClientFactory):
         controller.setKeyboardLayout(self._keyboardLayout)
         controller.setHostname(socket.gethostname())
         controller.setSecurityLevel(self._security)
+
+        # Wire up H.264 decoder-broken callback for auto-reconnect
+        controller.setDecoderBrokenCallback(self._onDecoderBroken)
         
         #set routing token for server redirection reconnection
         if self._redirectRoutingToken:
@@ -173,6 +177,17 @@ class RDPClientQtFactory(rdp.ClientFactory):
         
         return self._client
     
+    def _onDecoderBroken(self):
+        """Called from the Twisted thread when the H.264 decoder cannot recover.
+
+        Triggers an automatic reconnect so the user does not have to manually
+        close and reopen the window after a video freeze.
+        """
+        log.warning("H.264 decoder broken — scheduling auto-reconnect")
+        self._decoderBroken = True
+        from twisted.internet import reactor
+        reactor.callLater(0, self._client._controller.close)
+
     def _onResize(self, width, height):
         """
         @summary: Called when user resizes the window, triggers reconnection
@@ -193,6 +208,12 @@ class RDPClientQtFactory(rdp.ClientFactory):
         """
         if self._redirectRoutingToken:
             log.info("Reconnecting with routing token for server redirection")
+            connector.connect()
+            return
+
+        if self._decoderBroken:
+            log.info("Reconnecting after H.264 decoder failure")
+            self._decoderBroken = False
             connector.connect()
             return
 
