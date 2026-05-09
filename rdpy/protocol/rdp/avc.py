@@ -178,6 +178,203 @@ void nv12_lr_to_bgra(
     }
 }
 
+/* Region-aware YUV420p limited-range BT.601 -> BGRA.
+ * Only converts pixels within the n_rects dirty rectangles.
+ * rects: flat array of [left, top, right, bottom, ...] uint16_t tuples.
+ * Matches grdp's grdp_yuv420p_to_bgra_regions pattern. */
+void yuv420p_lr_to_bgra_regions(
+    const uint8_t *restrict Y, int y_stride,
+    const uint8_t *restrict U, int uv_stride,
+    const uint8_t *restrict V,
+    uint8_t *restrict bgra, int width, int height,
+    const uint16_t *rects, int n_rects)
+{
+    for (int i = 0; i < n_rects; i++) {
+        int left   = (int)rects[i*4+0];
+        int top    = (int)rects[i*4+1];
+        int right  = (int)rects[i*4+2];
+        int bottom = (int)rects[i*4+3];
+        if (left   < 0)      left   = 0;
+        if (top    < 0)      top    = 0;
+        if (right  > width)  right  = width;
+        if (bottom > height) bottom = height;
+        if (left >= right || top >= bottom) continue;
+        for (int row = top; row < bottom; row++) {
+            const uint8_t *Yr = Y + row * y_stride;
+            const uint8_t *Ur = U + (row >> 1) * uv_stride;
+            const uint8_t *Vr = V + (row >> 1) * uv_stride;
+            uint8_t *row_dst = bgra + row * width * 4;
+            int col = left;
+            /* Align to even column for the 2-pixel unrolled loop. */
+            if (col & 1) {
+                int d = (int)Ur[col >> 1] - 128;
+                int e = (int)Vr[col >> 1] - 128;
+                int c = ((int)Yr[col] - 16) * 298;
+                row_dst[col*4]   = clamp8((c + 516*d + 128) >> 8);
+                row_dst[col*4+1] = clamp8((c - 100*d - 208*e + 128) >> 8);
+                row_dst[col*4+2] = clamp8((c + 409*e + 128) >> 8);
+                row_dst[col*4+3] = 255;
+                col++;
+            }
+            for (; col + 1 < right; col += 2) {
+                int d = (int)Ur[col >> 1] - 128;
+                int e = (int)Vr[col >> 1] - 128;
+                int Rb = 409*e + 128;
+                int Gb = -100*d - 208*e + 128;
+                int Bb = 516*d + 128;
+                int c0 = ((int)Yr[col]     - 16) * 298;
+                int c1 = ((int)Yr[col + 1] - 16) * 298;
+                row_dst[col*4]   = clamp8((c0 + Bb) >> 8);
+                row_dst[col*4+1] = clamp8((c0 + Gb) >> 8);
+                row_dst[col*4+2] = clamp8((c0 + Rb) >> 8);
+                row_dst[col*4+3] = 255;
+                row_dst[col*4+4] = clamp8((c1 + Bb) >> 8);
+                row_dst[col*4+5] = clamp8((c1 + Gb) >> 8);
+                row_dst[col*4+6] = clamp8((c1 + Rb) >> 8);
+                row_dst[col*4+7] = 255;
+            }
+            if (col < right) {
+                int d = (int)Ur[col >> 1] - 128;
+                int e = (int)Vr[col >> 1] - 128;
+                int c = ((int)Yr[col] - 16) * 298;
+                row_dst[col*4]   = clamp8((c + 516*d + 128) >> 8);
+                row_dst[col*4+1] = clamp8((c - 100*d - 208*e + 128) >> 8);
+                row_dst[col*4+2] = clamp8((c + 409*e + 128) >> 8);
+                row_dst[col*4+3] = 255;
+            }
+        }
+    }
+}
+
+/* Region-aware YUV420p full-range BT.601 -> BGRA. */
+void yuv420p_fr_to_bgra_regions(
+    const uint8_t *restrict Y, int y_stride,
+    const uint8_t *restrict U, int uv_stride,
+    const uint8_t *restrict V,
+    uint8_t *restrict bgra, int width, int height,
+    const uint16_t *rects, int n_rects)
+{
+    for (int i = 0; i < n_rects; i++) {
+        int left   = (int)rects[i*4+0];
+        int top    = (int)rects[i*4+1];
+        int right  = (int)rects[i*4+2];
+        int bottom = (int)rects[i*4+3];
+        if (left   < 0)      left   = 0;
+        if (top    < 0)      top    = 0;
+        if (right  > width)  right  = width;
+        if (bottom > height) bottom = height;
+        if (left >= right || top >= bottom) continue;
+        for (int row = top; row < bottom; row++) {
+            const uint8_t *Yr = Y + row * y_stride;
+            const uint8_t *Ur = U + (row >> 1) * uv_stride;
+            const uint8_t *Vr = V + (row >> 1) * uv_stride;
+            uint8_t *row_dst = bgra + row * width * 4;
+            int col = left;
+            if (col & 1) {
+                int d = (int)Ur[col >> 1] - 128;
+                int e = (int)Vr[col >> 1] - 128;
+                int c = (int)Yr[col] << 8;
+                row_dst[col*4]   = clamp8((c + 454*d + 128) >> 8);
+                row_dst[col*4+1] = clamp8((c -  88*d - 183*e + 128) >> 8);
+                row_dst[col*4+2] = clamp8((c + 359*e + 128) >> 8);
+                row_dst[col*4+3] = 255;
+                col++;
+            }
+            for (; col + 1 < right; col += 2) {
+                int d = (int)Ur[col >> 1] - 128;
+                int e = (int)Vr[col >> 1] - 128;
+                int Rb = 359*e + 128;
+                int Gb = -88*d - 183*e + 128;
+                int Bb = 454*d + 128;
+                int c0 = (int)Yr[col]     << 8;
+                int c1 = (int)Yr[col + 1] << 8;
+                row_dst[col*4]   = clamp8((c0 + Bb) >> 8);
+                row_dst[col*4+1] = clamp8((c0 + Gb) >> 8);
+                row_dst[col*4+2] = clamp8((c0 + Rb) >> 8);
+                row_dst[col*4+3] = 255;
+                row_dst[col*4+4] = clamp8((c1 + Bb) >> 8);
+                row_dst[col*4+5] = clamp8((c1 + Gb) >> 8);
+                row_dst[col*4+6] = clamp8((c1 + Rb) >> 8);
+                row_dst[col*4+7] = 255;
+            }
+            if (col < right) {
+                int d = (int)Ur[col >> 1] - 128;
+                int e = (int)Vr[col >> 1] - 128;
+                int c = (int)Yr[col] << 8;
+                row_dst[col*4]   = clamp8((c + 454*d + 128) >> 8);
+                row_dst[col*4+1] = clamp8((c -  88*d - 183*e + 128) >> 8);
+                row_dst[col*4+2] = clamp8((c + 359*e + 128) >> 8);
+                row_dst[col*4+3] = 255;
+            }
+        }
+    }
+}
+
+/* Region-aware NV12 limited-range BT.601 -> BGRA.
+ * UV is interleaved: for luma column col, U=UV[col&~1], V=UV[(col&~1)+1].
+ * Matches grdp's grdp_nv12_to_bgra_regions pattern. */
+void nv12_lr_to_bgra_regions(
+    const uint8_t *restrict Y,  int y_stride,
+    const uint8_t *restrict UV, int uv_stride,
+    uint8_t *restrict bgra, int width, int height,
+    const uint16_t *rects, int n_rects)
+{
+    for (int i = 0; i < n_rects; i++) {
+        int left   = (int)rects[i*4+0];
+        int top    = (int)rects[i*4+1];
+        int right  = (int)rects[i*4+2];
+        int bottom = (int)rects[i*4+3];
+        if (left   < 0)      left   = 0;
+        if (top    < 0)      top    = 0;
+        if (right  > width)  right  = width;
+        if (bottom > height) bottom = height;
+        if (left >= right || top >= bottom) continue;
+        for (int row = top; row < bottom; row++) {
+            const uint8_t *Yr  = Y  + row * y_stride;
+            const uint8_t *UVr = UV + (row >> 1) * uv_stride;
+            uint8_t *row_dst = bgra + row * width * 4;
+            int col = left;
+            /* Align to even column (UV pair boundary). */
+            if (col & 1) {
+                int d = (int)UVr[col & ~1] - 128;
+                int e = (int)UVr[(col & ~1) + 1] - 128;
+                int c = ((int)Yr[col] - 16) * 298;
+                row_dst[col*4]   = clamp8((c + 516*d + 128) >> 8);
+                row_dst[col*4+1] = clamp8((c - 100*d - 208*e + 128) >> 8);
+                row_dst[col*4+2] = clamp8((c + 409*e + 128) >> 8);
+                row_dst[col*4+3] = 255;
+                col++;
+            }
+            for (; col + 1 < right; col += 2) {
+                int d = (int)UVr[col] - 128;
+                int e = (int)UVr[col + 1] - 128;
+                int Rb = 409*e + 128;
+                int Gb = -100*d - 208*e + 128;
+                int Bb = 516*d + 128;
+                int c0 = ((int)Yr[col]     - 16) * 298;
+                int c1 = ((int)Yr[col + 1] - 16) * 298;
+                row_dst[col*4]   = clamp8((c0 + Bb) >> 8);
+                row_dst[col*4+1] = clamp8((c0 + Gb) >> 8);
+                row_dst[col*4+2] = clamp8((c0 + Rb) >> 8);
+                row_dst[col*4+3] = 255;
+                row_dst[col*4+4] = clamp8((c1 + Bb) >> 8);
+                row_dst[col*4+5] = clamp8((c1 + Gb) >> 8);
+                row_dst[col*4+6] = clamp8((c1 + Rb) >> 8);
+                row_dst[col*4+7] = 255;
+            }
+            if (col < right) {
+                int d = (int)UVr[col] - 128;
+                int e = (int)UVr[col + 1] - 128;
+                int c = ((int)Yr[col] - 16) * 298;
+                row_dst[col*4]   = clamp8((c + 516*d + 128) >> 8);
+                row_dst[col*4+1] = clamp8((c - 100*d - 208*e + 128) >> 8);
+                row_dst[col*4+2] = clamp8((c + 409*e + 128) >> 8);
+                row_dst[col*4+3] = 255;
+            }
+        }
+    }
+}
+
 /* YUV444 (full-res U/V) limited-range BT.601 -> BGRA.
  * Used for AVC444 LC=2 chroma-upgrade combine output.
  * U and V have the same stride as Y (all full-resolution). */
@@ -266,6 +463,11 @@ def _get_c_lib():
         lib.nv12_lr_to_bgra.argtypes    = [ct_p, ct_i, ct_p, ct_i, ct_p, ct_i, ct_i]
         lib.yuv444_lr_to_bgra.argtypes  = [ct_p, ct_i, ct_p, ct_i, ct_p, ct_i, ct_p, ct_i, ct_i]
         lib.yuv444_fr_to_bgra.argtypes  = [ct_p, ct_i, ct_p, ct_i, ct_p, ct_i, ct_p, ct_i, ct_i]
+        # Region-aware variants: same args + flat uint16 rect array + count
+        ct_u16p = ctypes.c_void_p  # pointer to uint16_t array
+        lib.yuv420p_lr_to_bgra_regions.argtypes = [ct_p, ct_i, ct_p, ct_i, ct_p, ct_p, ct_i, ct_i, ct_u16p, ct_i]
+        lib.yuv420p_fr_to_bgra_regions.argtypes = [ct_p, ct_i, ct_p, ct_i, ct_p, ct_p, ct_i, ct_i, ct_u16p, ct_i]
+        lib.nv12_lr_to_bgra_regions.argtypes    = [ct_p, ct_i, ct_p, ct_i, ct_p, ct_i, ct_i, ct_u16p, ct_i]
         _c_lib = lib
         log.debug("AVC: native YUV->BGRA extension loaded (%s)" % so_path)
     except Exception as e:
@@ -327,7 +529,9 @@ def _get_yuv_bufs(h: int, w: int) -> dict:
         _yuv_buf_pool[key] = {
             'yuv':  np.empty((3, N), dtype=np.float32),
             'rgb':  np.empty((3, N), dtype=np.float32),
-            'bgra': np.empty((h, w, 4), dtype=np.uint8),
+            'bgra': np.zeros((h, w, 4), dtype=np.uint8),  # zeros: safe for region-aware partial updates
+            'U444': np.empty((h, w), dtype=np.uint8),
+            'V444': np.empty((h, w), dtype=np.uint8),
         }
     return _yuv_buf_pool[key]
 
@@ -442,6 +646,136 @@ def _frame_nv12_to_bgra(frame):
     return _bt601_yuv420_to_bgra(y, u_half, v_half, False)
 
 
+def _frame_to_bgra_regions(frame, fmt, regions, h, w):
+    """Region-aware YUV→BGRA: convert only pixels in *regions* dirty rects.
+
+    Matches grdp's regionHint / setRegionHint pattern.  Only the pixels
+    within each (left, top, right, bottom) rectangle are written into the
+    persistent pool BGRA buffer; unchanged areas keep their previous values.
+
+    Fast path: C extension (compiled at startup) — 3-13× faster than numpy
+    because it processes all BGRA channels in a single pass with UV terms
+    computed once per pixel pair, and Clang auto-vectorises to NEON/AVX.
+
+    Numpy fallback: when the C extension is unavailable, performs per-region
+    int32 BT.601 arithmetic using numpy's vectorised element-wise ops.  Still
+    much faster than full-frame conversion when only a small fraction of the
+    screen is dirty.
+
+    *regions* is a list of (left, top, right, bottom, ...) tuples from
+    _parse_avc420_stream.  Any tuple elements beyond index 3 are ignored.
+    Returns the pool BGRA array, or None for unsupported formats (caller falls
+    back to full-frame conversion).
+    """
+    bgra = _get_yuv_bufs(h, w)['bgra']
+
+    lib = _get_c_lib()
+    if lib is not None:
+        # C fast path: single-pass NEON/AVX auto-vectorised conversion.
+        rects_flat = np.array(
+            [v for r in regions for v in (r[0], r[1], r[2], r[3])],
+            dtype=np.uint16)
+        n_rects = ctypes.c_int(len(regions))
+        rects_ptr = _arr_ptr(rects_flat)
+
+        if fmt in ('yuv420p', 'yuvj420p'):
+            full_range = fmt in _FULL_RANGE_FORMATS
+            y = _plane_to_array(frame.planes[0])
+            u = _plane_to_array(frame.planes[1])
+            v = _plane_to_array(frame.planes[2])
+            fn = lib.yuv420p_fr_to_bgra_regions if full_range else lib.yuv420p_lr_to_bgra_regions
+            fn(_arr_ptr(y), y.strides[0],
+               _arr_ptr(u), u.strides[0],
+               _arr_ptr(v),
+               _arr_ptr(bgra), w, h,
+               rects_ptr, n_rects)
+            return bgra
+
+        if fmt == 'nv12':
+            y_p  = frame.planes[0]
+            uv_p = frame.planes[1]
+            y  = (np.frombuffer(y_p,  dtype=np.uint8)
+                  .reshape(y_p.height,  y_p.line_size)[:h, :w])
+            uv = (np.frombuffer(uv_p, dtype=np.uint8)
+                  .reshape(uv_p.height, uv_p.line_size)[:(h + 1) // 2, :w])
+            lib.nv12_lr_to_bgra_regions(
+                _arr_ptr(y),  y.strides[0],
+                _arr_ptr(uv), uv.strides[0],
+                _arr_ptr(bgra), w, h,
+                rects_ptr, n_rects)
+            return bgra
+
+        return None  # unknown format — caller uses full-frame path
+
+    # --- numpy fallback (no C compiler) ---
+    # Process only the dirty rectangles rather than the entire frame,
+    # saving work proportional to the unchanged screen area.
+    if fmt not in ('yuv420p', 'yuvj420p', 'nv12'):
+        return None
+
+    if fmt in ('yuv420p', 'yuvj420p'):
+        full_range = fmt in _FULL_RANGE_FORMATS
+        Y = _plane_to_array(frame.planes[0])
+        U_half = _plane_to_array(frame.planes[1])
+        V_half = _plane_to_array(frame.planes[2])
+        _yuv420p_regions_numpy(Y, U_half, V_half, bgra, regions, full_range)
+    else:  # nv12
+        y_p  = frame.planes[0]
+        uv_p = frame.planes[1]
+        Y  = (np.frombuffer(y_p,  dtype=np.uint8)
+              .reshape(y_p.height,  y_p.line_size)[:h, :w])
+        UV = (np.frombuffer(uv_p, dtype=np.uint8)
+              .reshape(uv_p.height, uv_p.line_size)[:(h + 1) // 2, :w])
+        U_half = UV[:, 0::2]
+        V_half = UV[:, 1::2]
+        _yuv420p_regions_numpy(Y, U_half, V_half, bgra, regions, False)
+    return bgra
+
+
+def _yuv420p_regions_numpy(Y, U_half, V_half, bgra, regions, full_range):
+    """Numpy per-region BT.601 YUV420p→BGRA conversion (C-extension fallback).
+
+    For each dirty rectangle, extracts numpy views of the YUV planes,
+    upsamples UV with np.repeat, and applies integer BT.601 arithmetic.
+    Much faster than full-frame conversion when dirty area is small, but
+    3-13× slower than the C extension (multiple passes, intermediate arrays).
+
+    Uses int32 arithmetic (matching the C integer coefficients) to avoid
+    overflow: e.g. (235-16)*298 = 65322 exceeds int16 max (32767).
+    """
+    if full_range:
+        ky, kr, kgu, kgv, kb, yoff = 256, 359, 88, 183, 454, 0
+    else:
+        ky, kr, kgu, kgv, kb, yoff = 298, 409, 100, 208, 516, 16
+
+    for r in regions:
+        left, top, right, bottom = int(r[0]), int(r[1]), int(r[2]), int(r[3])
+        left   = max(left,   0)
+        top    = max(top,    0)
+        right  = min(right,  Y.shape[1])
+        bottom = min(bottom, Y.shape[0])
+        if left >= right or top >= bottom:
+            continue
+
+        rh = bottom - top
+        rw = right - left
+
+        # Y region as int32 view (no copy for contiguous rows)
+        y_i = Y[top:bottom, left:right].astype(np.int32)
+
+        # UV half-res subregion: upsample 2× with np.repeat
+        u_raw = U_half[top // 2:(bottom + 1) // 2, left // 2:(right + 1) // 2]
+        v_raw = V_half[top // 2:(bottom + 1) // 2, left // 2:(right + 1) // 2]
+        u_i = np.repeat(np.repeat(u_raw, 2, axis=0)[:rh], 2, axis=1)[:, :rw].astype(np.int32) - 128
+        v_i = np.repeat(np.repeat(v_raw, 2, axis=0)[:rh], 2, axis=1)[:, :rw].astype(np.int32) - 128
+
+        c = (y_i - yoff) * ky
+        bgra[top:bottom, left:right, 0] = np.clip((c + kb * u_i + 128) >> 8, 0, 255)
+        bgra[top:bottom, left:right, 1] = np.clip((c - kgu * u_i - kgv * v_i + 128) >> 8, 0, 255)
+        bgra[top:bottom, left:right, 2] = np.clip((c + kr * v_i + 128) >> 8, 0, 255)
+        bgra[top:bottom, left:right, 3] = 255
+
+
 def _bt601_yuv444_to_bgra(y, u_full, v_full, full_range):
     """Convert YUV444 (full-resolution U/V planes) to a BGRA numpy array.
 
@@ -518,8 +852,9 @@ def _combine_avc444v2_bgra(y_plane, u_half, v_half, aux_frame, full_range, w, h)
     aux_u = _plane_to_array(aux_frame.planes[1])  # (half_h, half_w) logical
     aux_v = _plane_to_array(aux_frame.planes[2])  # (half_h, half_w) logical
 
-    U444 = np.empty((h, w), dtype=np.uint8)
-    V444 = np.empty((h, w), dtype=np.uint8)
+    bufs = _get_yuv_bufs(h, w)
+    U444 = bufs['U444']
+    V444 = bufs['V444']
 
     # B4/B5: odd columns, all rows — from aux_y
     U444[:h, 1::2] = aux_y[:h, :half_w]
@@ -844,7 +1179,7 @@ class AvcDecoder:
         Returns BGRA numpy array (dest_height, dest_width, 4) or None.
         No tobytes() copy — caller owns the returned array until done.
         """
-        _regions, h264_data = self._parse_avc420_stream(data)
+        regions, h264_data = self._parse_avc420_stream(data)
         if h264_data is None or len(h264_data) == 0:
             return None
 
@@ -852,7 +1187,7 @@ class AvcDecoder:
         if frame is None:
             return None
 
-        return self._frame_to_bgra(frame, dest_width, dest_height)
+        return self._frame_to_bgra(frame, dest_width, dest_height, regions=regions)
 
     def decode_avc420(self, data, dest_width, dest_height):
         """Decode AVC420 bitmap stream.
@@ -884,20 +1219,15 @@ class AvcDecoder:
 
         # Parse all rects in one struct call (4 uint16 per rect).
         raw = struct.unpack_from('<%dH' % (numRegionRects * 4), data, off)
-        rects = [(raw[i*4], raw[i*4+1], raw[i*4+2], raw[i*4+3])
-                 for i in range(numRegionRects)]
-        off += rects_size
-
-        # Quant quality vals: each 2 bytes (qpVal(1) + qualityMode flags(1))
+        qvals_off = off + rects_size
         qvals_size = numRegionRects * 2
-        if len(data) < off + qvals_size:
+        if len(data) < qvals_off + qvals_size:
             log.warning("AVC420: insufficient data for quant quality values")
             return [], None
-
-        regions = [(rects[i][0], rects[i][1], rects[i][2], rects[i][3],
-                    data[off + i*2], data[off + i*2 + 1])
+        regions = [(raw[i*4], raw[i*4+1], raw[i*4+2], raw[i*4+3],
+                    data[qvals_off + i*2], data[qvals_off + i*2 + 1])
                    for i in range(numRegionRects)]
-        off += qvals_size
+        off = qvals_off + qvals_size
 
         h264_data = data[off:]
         log.debug("AVC420: %d regions, %d bytes H.264 data" %
@@ -1151,9 +1481,13 @@ class AvcDecoder:
                 log.debug("AVC: decode #%d waiting for IDR (skipped %d non-IDR frames)" %
                           (self._decode_count, self._keyframe_wait_count))
             waited_too_long = (self._keyframe_wait_start > 0 and
-                               time.monotonic() - self._keyframe_wait_start >= self._KEYFRAME_WAIT_TIMEOUT)
+                               time.monotonic() - self._keyframe_wait_start >= (
+                                   self._KEYFRAME_WAIT_TIMEOUT if self.is_hardware
+                                   else self._KEYFRAME_WAIT_TIMEOUT_SW))
             if self._keyframe_wait_count >= self._KEYFRAME_WAIT_LIMIT or waited_too_long:
-                reason = ('keyframe wait timeout (%.1fs)' % self._KEYFRAME_WAIT_TIMEOUT
+                kf_timeout = (self._KEYFRAME_WAIT_TIMEOUT if self.is_hardware
+                              else self._KEYFRAME_WAIT_TIMEOUT_SW)
+                reason = ('keyframe wait timeout (%.1fs)' % kf_timeout
                           if waited_too_long
                           else 'keyframe wait limit (%d)' % self._KEYFRAME_WAIT_LIMIT)
                 self._hard_reset(reason=reason)
@@ -1244,7 +1578,8 @@ class AvcDecoder:
 
     _HW_ERROR_THRESHOLD = 5    # consecutive AVERROR_UNKNOWN errors before hard reset
     _KEYFRAME_WAIT_LIMIT = 900  # non-IDR frames dropped before giving up and hard-resetting
-    _KEYFRAME_WAIT_TIMEOUT = 15.0  # seconds in IDR-wait before hard-resetting (mirrors grdp)
+    _KEYFRAME_WAIT_TIMEOUT = 15.0     # seconds in IDR-wait before hard-resetting (HW decoder, mirrors grdp keyframeWaitTimeout)
+    _KEYFRAME_WAIT_TIMEOUT_SW = 5.0   # shorter timeout for SW decoder (mirrors grdp keyframeWaitTimeoutSW)
 
     @property
     def last_receive_time(self):
@@ -1308,7 +1643,7 @@ class AvcDecoder:
             result = frame
         return result
 
-    def _frame_to_bgra(self, frame, dest_width, dest_height):
+    def _frame_to_bgra(self, frame, dest_width, dest_height, regions=None):
         """Convert av.VideoFrame to a BGRA numpy array cropped/padded to dest_width x dest_height.
 
         Returns numpy array shape (dest_height, dest_width, 4) dtype uint8.
@@ -1323,6 +1658,11 @@ class AvcDecoder:
         VideoToolbox hardware frames (format='videotoolbox') are downloaded to
         NV12 first (a zero-cost pixel-copy, no colour conversion), then the
         NV12 fast path is taken.
+
+        When *regions* is a non-empty list and sizes match, uses region-aware
+        C functions (matching grdp's regionHint/setRegionHint pattern) to
+        update only dirty rectangle pixels in the persistent pool buffer,
+        saving YUV→BGRA conversion work proportional to the unchanged area.
         """
         fmt = frame.format.name
 
@@ -1336,7 +1676,22 @@ class AvcDecoder:
                      (self._decode_count, frame.width, frame.height,
                       dest_width, dest_height, fmt))
 
-        # Fast path: direct BT.601 YUV→BGRA without swscale.
+        src_h, src_w = frame.height, frame.width
+
+        # Region-aware path: only convert dirty rects into the persistent pool
+        # buffer (matching grdp's regionHint pattern).  Unchanged pixels keep
+        # their values from the previous frame, saving conversion work.
+        # Only valid when sizes match exactly and regions are available.
+        if (regions and len(regions) > 0 and
+                src_w == dest_width and src_h == dest_height and
+                fmt in ('yuv420p', 'yuvj420p', 'nv12')):
+            bgra = _frame_to_bgra_regions(frame, fmt, regions, src_h, src_w)
+            if bgra is not None:
+                if self._decode_count <= 1:
+                    self._save_debug_frame(bgra, dest_width, dest_height)
+                return bgra
+
+        # Full-frame path: direct BT.601 YUV→BGRA without swscale.
         if fmt in ('yuv420p', 'yuvj420p'):
             bgra = _frame_yuv420p_to_bgra(frame, fmt in _FULL_RANGE_FORMATS)
         elif fmt == 'nv12':
@@ -1344,8 +1699,6 @@ class AvcDecoder:
         else:
             # Fallback for any other format (e.g. yuv444p from some codecs).
             bgra = frame.reformat(format='bgra').to_ndarray()
-
-        src_h, src_w = bgra.shape[:2]
 
         if src_w == dest_width and src_h == dest_height:
             if self._decode_count <= 1:

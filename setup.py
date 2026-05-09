@@ -18,6 +18,11 @@ else:
                     "rdpy.protocol.rdp.zgfx",
                     ["rdpy/protocol/rdp/zgfx.pyx"],
                 ),
+                Extension(
+                    "rdpy.protocol.rdp.avc",
+                    ["rdpy/protocol/rdp/avc.pyx"],
+                    include_dirs=[__import__('numpy').get_include()],
+                ),
             ],
             compiler_directives={
                 "language_level": "3",

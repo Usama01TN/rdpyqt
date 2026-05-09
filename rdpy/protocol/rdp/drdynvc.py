@@ -713,7 +713,7 @@ class DrdynvcLayer(LayerAutomata):
         height = struct.unpack_from('<H', payload, 4)[0]
         pixelFormat = payload[6]
         self._surfaces[surfaceId] = (width, height, pixelFormat)
-        self._surfaceData[surfaceId] = bytearray(width * height * 4)
+        self._surfaceData[surfaceId] = np.zeros(height * width * 4, dtype=np.uint8)
         log.debug("RDPGFX: CREATE_SURFACE id=%d %dx%d fmt=0x%02x" %
                  (surfaceId, width, height, pixelFormat))
 
@@ -901,9 +901,9 @@ class DrdynvcLayer(LayerAutomata):
             if not rects:
                 return
             ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
-            # Numpy view for fast extraction
+            # Numpy view of surface for fast extraction
             try:
-                surf_arr = np.frombuffer(surfBuf, dtype=np.uint8).reshape(sh, sw * 4)
+                surf_arr = surfBuf.reshape(sh, sw * 4)
             except ValueError:
                 surf_arr = None
             for (rx, ry, rw, rh) in rects:
@@ -1339,10 +1339,9 @@ class DrdynvcLayer(LayerAutomata):
             usable = min(len(res_data) // 3, n_pixels)
             if usable > 0:
                 bgr = np.frombuffer(res_data[:usable * 3], dtype=np.uint8).reshape(usable, 3)
-                bgra = np.empty((usable, 4), dtype=np.uint8)
-                bgra[:, :3] = bgr
-                bgra[:, 3] = 0xFF
-                out[:usable * 4] = bgra.tobytes()
+                out_arr = np.frombuffer(out, dtype=np.uint8).reshape(-1, 4)
+                out_arr[:usable, :3] = bgr
+                out_arr[:usable, 3] = 0xFF
 
         # 2. Band layer
         if band_len > 0:
@@ -1491,23 +1490,24 @@ class DrdynvcLayer(LayerAutomata):
                     bgra = np.empty((usable_sc, 4), dtype=np.uint8)
                     bgra[:, :3] = bgr
                     bgra[:, 3] = 0xFF
-                    bgra_2d = bgra.reshape(h, w, 4) if usable_sc == w * h else None
-                    if bgra_2d is not None:
-                        for y in range(h):
-                            dy = y_start + y
-                            di = (dy * surfW + x_start) * 4
-                            if di + w * 4 <= len(out):
-                                out[di:di + w * 4] = bgra_2d[y].tobytes()
+                    if usable_sc == w * h:
+                        out_arr = np.frombuffer(out, dtype=np.uint8).reshape(-1, surfW * 4)
+                        bgra_rows = bgra.reshape(h, w * 4)
+                        y_end = min(y_start + h, out_arr.shape[0])
+                        x_end = min((x_start + w) * 4, out_arr.shape[1])
+                        out_arr[y_start:y_end, x_start * 4:x_end] = bgra_rows[:y_end - y_start, :x_end - x_start * 4]
             elif subcodec_id == 2:
                 # NSCodec (single color fill): 3 bytes BGR
                 if len(bmp_data) >= 3:
-                    pixel = bytes([bmp_data[0], bmp_data[1], bmp_data[2], 0xFF])
-                    row_data = pixel * w
-                    for y in range(h):
-                        dy = y_start + y
-                        di = (dy * surfW + x_start) * 4
-                        if di + w * 4 <= len(out):
-                            out[di:di + w * 4] = row_data
+                    fill_row = np.empty(w * 4, dtype=np.uint8)
+                    fill_row[0::4] = bmp_data[0]
+                    fill_row[1::4] = bmp_data[1]
+                    fill_row[2::4] = bmp_data[2]
+                    fill_row[3::4] = 0xFF
+                    out_arr = np.frombuffer(out, dtype=np.uint8).reshape(-1, surfW * 4)
+                    y_end = min(y_start + h, out_arr.shape[0])
+                    x_end = min((x_start + w) * 4, out_arr.shape[1])
+                    out_arr[y_start:y_end, x_start * 4:x_end] = fill_row[:x_end - x_start * 4]
 
     def _blitToSurface(self, surfaceId, left, top, width, height, data):
         """Write pixel data (top-down BGRA) into the surface buffer."""
@@ -1519,8 +1519,9 @@ class DrdynvcLayer(LayerAutomata):
         surfH = surfInfo[1]
         # Use numpy views for bulk 2D copy (avoids Python row loop)
         try:
-            src = np.frombuffer(data, dtype=np.uint8).reshape(height, width * 4)
-            dst = np.frombuffer(surfBuf, dtype=np.uint8).reshape(surfH, surfW * 4)
+            src = (data.reshape(height, width * 4) if isinstance(data, np.ndarray)
+                   else np.frombuffer(data, dtype=np.uint8).reshape(height, width * 4))
+            dst = surfBuf.reshape(surfH, surfW * 4)
             dst[top:top + height, left * 4:(left + width) * 4] = src
         except (ValueError, IndexError):
             # Fallback for mismatched sizes
@@ -1554,7 +1555,7 @@ class DrdynvcLayer(LayerAutomata):
         surfH = surfInfo[1]
         # Use numpy for fast region extraction
         try:
-            surf_arr = np.frombuffer(surfBuf, dtype=np.uint8).reshape(surfH, surfW * 4)
+            surf_arr = surfBuf.reshape(surfH, surfW * 4)
             region = surf_arr[rectTop:rectTop + h, rectLeft * 4:(rectLeft + w) * 4].tobytes()
             region = bytearray(region)
         except (ValueError, IndexError):
@@ -1592,7 +1593,7 @@ class DrdynvcLayer(LayerAutomata):
 
         # Numpy views for fast blit
         try:
-            surf_arr = np.frombuffer(surfBuf, dtype=np.uint8).reshape(surfH, surfW * 4)
+            surf_arr = surfBuf.reshape(surfH, surfW * 4)
             cache_arr = np.frombuffer(cdata, dtype=np.uint8).reshape(ch, cw * 4)
             use_numpy = True
         except ValueError:
@@ -1661,7 +1662,7 @@ class DrdynvcLayer(LayerAutomata):
 
         # Numpy view of surface for fast region extraction
         try:
-            surf_arr = np.frombuffer(surfBuf, dtype=np.uint8).reshape(surfH, surfW * 4)
+            surf_arr = surfBuf.reshape(surfH, surfW * 4)
         except ValueError:
             surf_arr = None
 
