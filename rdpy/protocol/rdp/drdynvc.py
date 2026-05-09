@@ -978,11 +978,17 @@ class DrdynvcLayer(LayerAutomata):
     # IDR/SPS before we declare a stall — mirrors grdp's avcHWReadyFreezeThreshold.
     _AVC_FREEZE_THRESHOLD = 7.0
     # Minimum seconds between consecutive IDR refresh requests (cooldown).
-    _AVC_REFRESH_COOLDOWN = 15.0
-    # Also trigger recovery when this many consecutive null frames accumulate
-    # and at least _AVC_FREEZE_MIN_SECS have passed (guards against startup noise).
+    # Kept low (5 s) so stall recovery is not blocked for too long after a
+    # previous request.  The old value of 15 s allowed null_count to accumulate
+    # from 30 to 104 (log confirmed) before a second request could go out.
+    _AVC_REFRESH_COOLDOWN = 5.0
+    # Also trigger recovery when this many consecutive null frames accumulate.
+    # NOTE: _AVC_FREEZE_MIN_SECS was intentionally removed: it caused the count
+    # trigger to miss when LC=2 (aux decoder) successes kept resetting
+    # _avcLastSuccessTime, masking the main decoder's null run.  The startup
+    # guard (_avcLastSuccessTime == 0.0 → return) already prevents false
+    # positives during initialisation.
     _AVC_NULL_FRAME_THRESHOLD = 30
-    _AVC_FREEZE_MIN_SECS = 1.0
     # (Unused constant kept for reference; fast keyframe-request path was removed
     # because repeated SupressOutputDataPDU calls disconnect some servers.)
     _AVC_KEYFRAME_REQUEST_INTERVAL = 2.0
@@ -1157,8 +1163,7 @@ class DrdynvcLayer(LayerAutomata):
                 return
 
         null_count = self._avcDecoder.null_count if self._avcDecoder else 0
-        count_triggered = (null_count >= self._AVC_NULL_FRAME_THRESHOLD and
-                           frozen_for >= self._AVC_FREEZE_MIN_SECS)
+        count_triggered = null_count >= self._AVC_NULL_FRAME_THRESHOLD
         time_triggered = frozen_for >= self._AVC_FREEZE_THRESHOLD
 
         if not (count_triggered or time_triggered):
