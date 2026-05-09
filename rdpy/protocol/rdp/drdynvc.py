@@ -1044,9 +1044,27 @@ class DrdynvcLayer(LayerAutomata):
                 return
             if isinstance(bgra_arr, bytes):
                 # b"" sentinel: LC=2 frame not yet decodable (aux decoder not
-                # primed or no cached luma).  Do NOT update _avcLastSuccessTime:
-                # the luma decoder may be the source of a freeze, and LC=2
-                # frames arriving independently should not mask it.
+                # primed, no cached luma, or Y cache stale — main decoder likely
+                # stalling).  Do NOT update _avcLastSuccessTime: the luma decoder
+                # may be the source of a freeze, and LC=2 frames arriving
+                # independently should not mask it.
+                #
+                # When the Y cache is stale the main decoder is stalling; request
+                # a keyframe at _AVC_KEYFRAME_REQUEST_INTERVAL rate so the server
+                # delivers a fresh IDR.  Mirrors grdp's decodeAVC444LC2 staleness
+                # path which calls onKeyframeRequest with its own rate-limiter.
+                decoder = self._avcDecoder
+                if (decoder is not None and decoder._avc444_y is not None
+                        and decoder._avc444_y_updated_at > 0.0):
+                    now = time.monotonic()
+                    age = now - decoder._avc444_y_updated_at
+                    if (age > decoder._AVC444_Y_STALENESS
+                            and now - self._avcLastRefreshTime >= self._AVC_KEYFRAME_REQUEST_INTERVAL):
+                        log.debug("RDPGFX: AVC444 LC=2 Y cache stale (%.0fms), requesting keyframe"
+                                  % (age * 1000))
+                        self._avcLastRefreshTime = now
+                        if self._requestRefreshCallback is not None:
+                            self._requestRefreshCallback()
                 #
                 # However, if the main decoder is working (recent _avcLastSuccessTime)
                 # but LC=2 keeps returning the sentinel, the aux decoder is stuck in

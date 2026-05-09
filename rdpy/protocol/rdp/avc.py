@@ -973,6 +973,7 @@ class AvcDecoder:
         self._avc444_full_range = False
         self._avc444_w = 0
         self._avc444_h = 0
+        self._avc444_y_updated_at = 0.0  # monotonic time of last Y-plane cache refresh
         self._init_decoder()
 
     def _init_decoder(self):
@@ -1337,6 +1338,7 @@ class AvcDecoder:
         self._avc444_v = _plane_to_array(frame.planes[2]).copy()
         self._avc444_w = frame.width
         self._avc444_h = frame.height
+        self._avc444_y_updated_at = time.monotonic()
 
     def _prime_aux_decoder(self, h264_data):
         """Feed stream2 data to the auxiliary decoder to advance past its IDR.
@@ -1366,11 +1368,18 @@ class AvcDecoder:
             log.debug("AVC444: auxiliary decoder initialized")
         return self._dec2
 
+    # Maximum age of the Y-plane cache before an LC=2 combine is suppressed.
+    # Mirrors grdp's avc444YStaleness (500 ms).  When the main decoder is
+    # stalling (producing null frames), the Y cache is not refreshed; combining
+    # stale luma with fresh chroma produces visible colour artefacts.
+    _AVC444_Y_STALENESS = 0.5  # seconds
+
     def _decode_avc444_lc2(self, data, dest_width, dest_height):
         """Decode AVC444 LC=2 (chroma-upgrade) frame and combine with cached luma.
 
         Returns a BGRA numpy array on success, or b"" when the auxiliary
-        decoder is not yet primed or the luma cache is empty.
+        decoder is not yet primed, the luma cache is empty, or the luma cache
+        is stale (main decoder likely stalling).
         """
         if self._dec2 is None:
             log.debug("AVC444: LC=2 skipped (aux decoder not yet initialized)")
@@ -1378,6 +1387,17 @@ class AvcDecoder:
         if self._avc444_y is None:
             log.debug("AVC444: LC=2 skipped (no cached luma)")
             return b""
+        # Staleness guard: mirrors grdp decodeAVC444LC2 avc444YStaleness check.
+        # If the main decoder hasn't refreshed the Y-plane for > _AVC444_Y_STALENESS
+        # seconds it is likely stalling.  Suppress LC=2 output to avoid colour
+        # artefacts from combining old luma with fresh chroma, and signal the
+        # caller that a keyframe is needed.
+        if self._avc444_y_updated_at > 0.0:
+            age = time.monotonic() - self._avc444_y_updated_at
+            if age > self._AVC444_Y_STALENESS:
+                log.debug("AVC444: LC=2 skipped (Y cache stale %.0fms, main decoder likely stalling)"
+                          % (age * 1000))
+                return b""
 
         _regions, h264_data = self._parse_avc420_stream(data)
         if h264_data is None or len(h264_data) == 0:
