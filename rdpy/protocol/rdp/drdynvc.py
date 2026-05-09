@@ -994,6 +994,8 @@ class DrdynvcLayer(LayerAutomata):
     _AVC_KEYFRAME_REQUEST_INTERVAL = 2.0
     # Seconds after a hard reset before giving up and triggering a full reconnect.
     # Gives the server time to respond to the post-reset ForceRefresh.
+    # When the server is actively sending LC=2 frames (server_active), this is
+    # halved: an active server that ignores IDR requests is definitively stuck.
     _AVC_RECONNECT_TIMEOUT = 10.0
 
     def _renderAvc420(self, surfaceId, left, top, width, height, data):
@@ -1146,19 +1148,32 @@ class DrdynvcLayer(LayerAutomata):
         if self._avcDecoder and self._avcDecoder.needs_keyframe:
             now = time.monotonic()
             # If a hard reset has fired but the server still hasn't sent an IDR
-            # after _AVC_RECONNECT_TIMEOUT seconds, trigger a full reconnect.
+            # after the reconnect timeout, trigger a full reconnect.
             # This handles the "server ignores ForceRefresh" deadlock.
-            if (self._avcHardResetTime > 0.0 and
-                    not self._avcDecoderBrokenNotified and
-                    now - self._avcHardResetTime >= self._AVC_RECONNECT_TIMEOUT):
-                self._avcDecoderBrokenNotified = True
-                log.warning("RDPGFX: AVC still frozen %.0fs after hard reset"
-                            " — triggering reconnect (lastLC2=%.1fs ago)"
-                            % (self._AVC_RECONNECT_TIMEOUT,
-                               now - self._lastLC2RecvTime if self._lastLC2RecvTime > 0.0 else -1.0))
-                if self._decoderBrokenCallback is not None:
-                    self._decoderBrokenCallback()
-                return
+            #
+            # Use a shorter timeout when the server is actively sending LC=2
+            # frames: if it is sending data but not responding to IDR requests,
+            # it is definitively stuck and a full reconnect is the only fix.
+            # "Active" = LC=2 received within the last 2 s.
+            # Quieter servers (static screen or no LC=2) get the full timeout.
+            if self._avcHardResetTime > 0.0 and not self._avcDecoderBrokenNotified:
+                lc2_age = (now - self._lastLC2RecvTime
+                           if self._lastLC2RecvTime > 0.0 else float('inf'))
+                server_active = lc2_age < 2.0
+                reconnect_timeout = (self._AVC_RECONNECT_TIMEOUT / 2
+                                     if server_active
+                                     else self._AVC_RECONNECT_TIMEOUT)
+                if now - self._avcHardResetTime >= reconnect_timeout:
+                    self._avcDecoderBrokenNotified = True
+                    log.warning(
+                        "RDPGFX: AVC still frozen %.0fs after hard reset"
+                        " — triggering reconnect (lastLC2=%.1fs ago%s)"
+                        % (reconnect_timeout,
+                           lc2_age if lc2_age != float('inf') else -1.0,
+                           ", server active" if server_active else ""))
+                    if self._decoderBrokenCallback is not None:
+                        self._decoderBrokenCallback()
+                    return
             if now - self._avcLastRefreshTime >= self._AVC_KEYFRAME_REQUEST_INTERVAL:
                 self._avcLastRefreshTime = now
                 log.debug("RDPGFX: AVC: still waiting for IDR, re-requesting refresh")
