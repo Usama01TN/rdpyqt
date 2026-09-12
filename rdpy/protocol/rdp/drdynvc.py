@@ -110,28 +110,9 @@ RDPGFX_CAPS_FLAG_SMALL_CACHE = 0x00000002
 RDPGFX_CAPS_FLAG_AVC420_ENABLED = 0x00000010  # v8.1: explicitly enable AVC420
 
 # ClearCodec log2 floor table for palette bit calculation (MS-RDPEGFX 2.2.4.1.1.2)
-_CLEAR_LOG2_FLOOR = bytes([
-    0,
-    1, 1,
-    2, 2, 2, 2,
-    3, 3, 3, 3, 3, 3, 3, 3,
-    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
-    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
-    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-])
+_CLEAR_LOG2_FLOOR = bytes(
+    [0] * 2 + [1] * 2 + [2] * 4 + [3] * 8 + [4] * 16 + [5] * 32 + [6] * 64 + [7] * 128
+)
 RDPGFX_CAPS_FLAG_AVC_DISABLED = 0x00000020    # v10+: disable AVC
 RDPGFX_CAPS_FLAG_AVC_THINCLIENT = 0x00000040  # v10.3+: AVC thin client
 
@@ -804,7 +785,6 @@ class DrdynvcLayer(LayerAutomata):
             return
         surfaceId, codecId = struct.unpack_from('<HH', payload, 0)
         pixelFormat = payload[4]
-        # destRect: left(2) + top(2) + right(2) + bottom(2)
         left, top, right, bottom = struct.unpack_from('<HHHH', payload, 5)
         bitmapDataLen, = struct.unpack_from('<I', payload, 13)
         bitmapData = payload[17:17 + bitmapDataLen]
@@ -898,6 +878,12 @@ class DrdynvcLayer(LayerAutomata):
                 return
             w, h, _ = surfInfo
             self._renderAvc444(surfaceId, 0, 0, w, h, bitmapData)
+        elif codecId == RDPGFX_CODECID_CLEARCODEC:
+            if surfInfo is None:
+                log.warning("RDPGFX: WTS2 unknown surface %d" % surfaceId)
+                return
+            w, h, _ = surfInfo
+            self._renderClearCodec(surfaceId, 0, 0, w, h, pixelFormat, bitmapData)
         else:
             log.debug("RDPGFX: WTS2 unsupported codec 0x%04x" % codecId)
 
@@ -1515,7 +1501,7 @@ class DrdynvcLayer(LayerAutomata):
         if len(data) < 2:
             return bytearray(width * height * 4)
 
-        flags = struct.unpack_from('<H', data, 0)[0]
+        flags = data[0]
         off = 2
 
         if flags & 0x04:  # CLEARCODEC_FLAG_CACHE_RESET

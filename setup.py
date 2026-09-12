@@ -27,6 +27,7 @@ else:
                     "rdpy.protocol.rdp.rfx_progressive",
                     ["rdpy/protocol/rdp/rfx_progressive.pyx"],
                     include_dirs=[__import__('numpy').get_include()],
+                    extra_compile_args=["-O3"],
                 ),
             ],
             compiler_directives={
