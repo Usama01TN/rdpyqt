@@ -171,9 +171,9 @@ class RfxDecoder:
         q_cb = self._get_quant(quants, quant_idx_cb)
         q_cr = self._get_quant(quants, quant_idx_cr)
 
-        y_pixels = _decode_component(y_data, q_y)
-        cb_pixels = _decode_component(cb_data, q_cb)
-        cr_pixels = _decode_component(cr_data, q_cr)
+        y_pixels, _, _ = _decode_component(y_data, q_y)
+        cb_pixels, _, _ = _decode_component(cb_data, q_cb)
+        cr_pixels, _, _ = _decode_component(cr_data, q_cr)
 
         # Tile pixel position = WTS1 offset + tile grid index * 64
         tile_x = left + x_idx * RFX_TILE_SIZE

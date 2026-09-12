@@ -667,6 +667,8 @@ class DrdynvcLayer(LayerAutomata):
             self._onWireToSurface2(payload)
         elif cmdId == RDPGFX_CMDID_SOLIDFILL:
             self._onSolidFill(payload)
+        elif cmdId == RDPGFX_CMDID_SURFACETOSURFACE:
+            self._onSurfaceToSurface(payload)
         elif cmdId == RDPGFX_CMDID_SURFACETOCACHE:
             self._onSurfaceToCache(payload)
         elif cmdId == RDPGFX_CMDID_CACHETOSURFACE:
@@ -680,7 +682,7 @@ class DrdynvcLayer(LayerAutomata):
         elif cmdId == RDPGFX_CMDID_MAPSURFACETOWINDOW:
             log.debug("RDPGFX: MAPSURFACETOWINDOW len=%d" % len(payload))
         elif cmdId == RDPGFX_CMDID_MAPSURFACETOSCALEDOUTPUT:
-            log.debug("RDPGFX: MAPSURFACETOSCALEDOUTPUT len=%d" % len(payload))
+            self._onMapSurfaceToScaledOutput(payload)
         else:
             log.debug("RDPGFX: %s len=%d" % (name, len(payload)))
 
@@ -936,6 +938,62 @@ class DrdynvcLayer(LayerAutomata):
             self._blitToSurface(surfaceId, left, top, w, h, bitmapData)
             ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
             self._deliverBitmap(ox + left, oy + top, w, h, 32, bitmapData)
+
+    def _onSurfaceToSurface(self, payload):
+        """SURFACE_TO_SURFACE: srcSurfaceId(2) + destSurfaceId(2) + rcSrc(8) + destPtsCount(2) + destPts"""
+        if len(payload) < 14:
+            return
+        srcId, dstId = struct.unpack_from('<HH', payload, 0)
+        left, top, right, bottom = struct.unpack_from('<HHHH', payload, 4)
+        destPtsCount, = struct.unpack_from('<H', payload, 12)
+
+        srcInfo = self._surfaces.get(srcId)
+        dstInfo = self._surfaces.get(dstId)
+        srcBuf = self._surfaceData.get(srcId)
+        dstBuf = self._surfaceData.get(dstId)
+        if srcInfo is None or dstInfo is None or srcBuf is None or dstBuf is None:
+            return
+
+        w = right - left
+        h = bottom - top
+        if w <= 0 or h <= 0:
+            return
+
+        srcW, srcH, _ = srcInfo
+        dstW, dstH, _ = dstInfo
+        src_stride = srcW * 4
+        dst_stride = dstW * 4
+        row_bytes = w * 4
+
+        # Read source rect into temporary buffer
+        src_data = bytearray(w * h * 4)
+        for row in range(h):
+            src_row = top + row
+            if 0 <= src_row < srcH:
+                src_off = src_row * src_stride + left * 4
+                dst_off = row * row_bytes
+                if src_off + row_bytes <= len(srcBuf):
+                    src_data[dst_off:dst_off + row_bytes] = srcBuf[src_off:src_off + row_bytes]
+
+        ox, oy = self._surfaceOutputMap.get(dstId, (0, 0))
+        offset = 14
+        for _ in range(destPtsCount):
+            if offset + 4 > len(payload):
+                break
+            destX, destY = struct.unpack_from('<HH', payload, offset)
+            offset += 4
+
+            self._blitToSurface(dstId, destX, destY, w, h, src_data)
+            self._deliverBitmap(ox + destX, oy + destY, w, h, 32, bytes(src_data))
+
+    def _onMapSurfaceToScaledOutput(self, payload):
+        """MAPSURFACETOSCALEDOUTPUT: surfaceId(2) + reserved(2) + outputOriginX(4) + outputOriginY(4) + targetWidth(4) + targetHeight(4)"""
+        if len(payload) < 20:
+            return
+        surfaceId = struct.unpack_from('<H', payload, 0)[0]
+        outputOriginX = struct.unpack_from('<I', payload, 4)[0]
+        outputOriginY = struct.unpack_from('<I', payload, 8)[0]
+        self._surfaceOutputMap[surfaceId] = (outputOriginX, outputOriginY)
 
     def _renderCaVideo(self, surfaceId, left, top, width, height, data):
         """Decode CaVideo (0x0003) RFX tile data onto surface (WTS1)."""
@@ -1447,6 +1505,12 @@ class DrdynvcLayer(LayerAutomata):
         ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
         self._deliverBitmap(ox + left, oy + top, width, height, 32, bytes(out))
 
+    def _resetClearCodecVBar(self):
+        self._ccVBarStorage = [None] * 32768
+        self._ccShortVBarStorage = [None] * 16384
+        self._ccVBarCursor = 0
+        self._ccShortVBarCursor = 0
+
     def _decodeClearCodec(self, data, width, height):
         if len(data) < 2:
             return bytearray(width * height * 4)
@@ -1760,21 +1824,33 @@ class DrdynvcLayer(LayerAutomata):
             return
         surfW = surfInfo[0]
         surfH = surfInfo[1]
-        # Use numpy views for bulk 2D copy (avoids Python row loop)
+
+        # Calculate clipped intersection
+        x0 = max(0, left)
+        y0 = max(0, top)
+        x1 = min(surfW, left + width)
+        y1 = min(surfH, top + height)
+        if x1 <= x0 or y1 <= y0:
+            return
+
+        src_x = x0 - left
+        src_y = y0 - top
+        clip_w = x1 - x0
+        clip_h = y1 - y0
+
         try:
             src = (data.reshape(height, width * 4) if isinstance(data, np.ndarray)
                    else np.frombuffer(data, dtype=np.uint8).reshape(height, width * 4))
             dst = surfBuf.reshape(surfH, surfW * 4)
-            dst[top:top + height, left * 4:(left + width) * 4] = src
+            dst[y0:y1, x0 * 4:x1 * 4] = src[src_y:src_y + clip_h, src_x * 4:(src_x + clip_w) * 4]
         except (ValueError, IndexError):
-            # Fallback for mismatched sizes
-            stride = width * 4
+            stride = surfW * 4
+            src_stride = width * 4
             src_bytes = bytes(data) if not isinstance(data, (bytes, bytearray, memoryview)) else data
-            for row in range(height):
-                src_off = row * stride
-                dst_off = ((top + row) * surfW + left) * 4
-                if src_off + stride <= len(src_bytes) and dst_off + stride <= len(surfBuf):
-                    surfBuf[dst_off:dst_off + stride] = np.frombuffer(src_bytes[src_off:src_off + stride], dtype=np.uint8)
+            for row in range(clip_h):
+                src_off = (src_y + row) * src_stride + src_x * 4
+                dst_off = (y0 + row) * stride + x0 * 4
+                surfBuf[dst_off:dst_off + clip_w * 4] = np.frombuffer(src_bytes[src_off:src_off + clip_w * 4], dtype=np.uint8)
 
     def _onSurfaceToCache(self, payload):
         """SURFACETOCACHE: surfaceId(2) + cacheKey(8) + cacheSlot(2) + rectLeft(2) +
@@ -1853,22 +1929,7 @@ class DrdynvcLayer(LayerAutomata):
             off += 4
             dest_coords.append((dx, dy))
 
-            if use_numpy:
-                try:
-                    surf_arr[dy:dy + ch, dx * 4:(dx + cw) * 4] = cache_arr
-                except (ValueError, IndexError):
-                    for row in range(ch):
-                        src_off = row * cw * 4
-                        dst_off = ((dy + row) * surfW + dx) * 4
-                        if dst_off + cw * 4 <= len(surfBuf) and src_off + cw * 4 <= len(cdata):
-                            surfBuf[dst_off:dst_off + cw * 4] = np.frombuffer(cdata[src_off:src_off + cw * 4], dtype=np.uint8)
-            else:
-                for row in range(ch):
-                    src_off = row * cw * 4
-                    dst_off = ((dy + row) * surfW + dx) * 4
-                    if dst_off + cw * 4 <= len(surfBuf) and src_off + cw * 4 <= len(cdata):
-                        surfBuf[dst_off:dst_off + cw * 4] = np.frombuffer(cdata[src_off:src_off + cw * 4], dtype=np.uint8)
-
+            self._blitToSurface(surfaceId, dx, dy, cw, ch, cdata)
             self._deliverBitmap(ox + dx, oy + dy, cw, ch, 32, bytes(cdata))
 
         first_coords = ", ".join("(%d,%d)" % (dx, dy) for dx, dy in dest_coords[:5])

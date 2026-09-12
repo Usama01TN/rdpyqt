@@ -23,6 +23,11 @@ else:
                     ["rdpy/protocol/rdp/avc.pyx"],
                     include_dirs=[__import__('numpy').get_include()],
                 ),
+                Extension(
+                    "rdpy.protocol.rdp.rfx_progressive",
+                    ["rdpy/protocol/rdp/rfx_progressive.pyx"],
+                    include_dirs=[__import__('numpy').get_include()],
+                ),
             ],
             compiler_directives={
                 "language_level": "3",
