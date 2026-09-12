@@ -922,8 +922,9 @@ class DrdynvcLayer(LayerAutomata):
             bitmapData = row * h
             # Update surface buffer so cache operations see the fill
             self._blitToSurface(surfaceId, left, top, w, h, bitmapData)
-            ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
-            self._deliverBitmap(ox + left, oy + top, w, h, 32, bitmapData)
+            if surfaceId in self._surfaceOutputMap:
+                ox, oy = self._surfaceOutputMap[surfaceId]
+                self._deliverBitmap(ox + left, oy + top, w, h, 32, bitmapData)
 
     def _onSurfaceToSurface(self, payload):
         """SURFACE_TO_SURFACE: srcSurfaceId(2) + destSurfaceId(2) + rcSrc(8) + destPtsCount(2) + destPts"""
@@ -952,16 +953,23 @@ class DrdynvcLayer(LayerAutomata):
         row_bytes = w * 4
 
         # Read source rect into temporary buffer
-        src_data = bytearray(w * h * 4)
-        for row in range(h):
-            src_row = top + row
-            if 0 <= src_row < srcH:
-                src_off = src_row * src_stride + left * 4
-                dst_off = row * row_bytes
-                if src_off + row_bytes <= len(srcBuf):
-                    src_data[dst_off:dst_off + row_bytes] = srcBuf[src_off:src_off + row_bytes]
+        try:
+            surf_arr = srcBuf.reshape(srcH, srcW * 4)
+            src_data = surf_arr[top:top + h, left * 4:(left + w) * 4].tobytes()
+        except (ValueError, IndexError):
+            src_data = bytearray(w * h * 4)
+            for row in range(h):
+                src_row = top + row
+                if 0 <= src_row < srcH:
+                    src_off = src_row * src_stride + left * 4
+                    dst_off = row * row_bytes
+                    if src_off + row_bytes <= len(srcBuf):
+                        row_data = srcBuf[src_off:src_off + row_bytes]
+                        src_data[dst_off:dst_off + row_bytes] = row_data.tobytes() if isinstance(row_data, np.ndarray) else row_data
 
-        ox, oy = self._surfaceOutputMap.get(dstId, (0, 0))
+        is_mapped = dstId in self._surfaceOutputMap
+        if is_mapped:
+            ox, oy = self._surfaceOutputMap[dstId]
         offset = 14
         for _ in range(destPtsCount):
             if offset + 4 > len(payload):
@@ -970,7 +978,8 @@ class DrdynvcLayer(LayerAutomata):
             offset += 4
 
             self._blitToSurface(dstId, destX, destY, w, h, src_data)
-            self._deliverBitmap(ox + destX, oy + destY, w, h, 32, bytes(src_data))
+            if is_mapped:
+                self._deliverBitmap(ox + destX, oy + destY, w, h, 32, bytes(src_data))
 
     def _onMapSurfaceToScaledOutput(self, payload):
         """MAPSURFACETOSCALEDOUTPUT: surfaceId(2) + reserved(2) + outputOriginX(4) + outputOriginY(4) + targetWidth(4) + targetHeight(4)"""
@@ -993,7 +1002,9 @@ class DrdynvcLayer(LayerAutomata):
             rects = self._rfxTileDecoder.decode(data, left, top, surfBuf, sw, sh)
             if not rects:
                 return
-            ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
+            if surfaceId not in self._surfaceOutputMap:
+                return
+            ox, oy = self._surfaceOutputMap[surfaceId]
             # Numpy view of surface for fast extraction
             try:
                 surf_arr = surfBuf.reshape(sh, sw * 4)
@@ -1105,16 +1116,17 @@ class DrdynvcLayer(LayerAutomata):
             self._avcHardResetTime = 0.0  # decoder recovered; cancel reconnect countdown
             self._avcSoftResetCount = 0   # reset soft-reset counter on success
             self._blitToSurface(surfaceId, left, top, width, height, bgra_arr)
-            ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
-            if self._gfxSurfaceCallback is not None:
-                surfInfo = self._surfaces.get(surfaceId)
-                surfBuf = self._surfaceData.get(surfaceId)
-                if surfInfo is not None and surfBuf is not None:
-                    self._gfxSurfaceCallback(ox + left, oy + top, width, height,
-                                             surfBuf, surfInfo[0], left, top)
-                    return
-            self._deliverBitmap(ox + left, oy + top, width, height, 32,
-                                bgra_arr.tobytes())
+            if surfaceId in self._surfaceOutputMap:
+                ox, oy = self._surfaceOutputMap[surfaceId]
+                if self._gfxSurfaceCallback is not None:
+                    surfInfo = self._surfaces.get(surfaceId)
+                    surfBuf = self._surfaceData.get(surfaceId)
+                    if surfInfo is not None and surfBuf is not None:
+                        self._gfxSurfaceCallback(ox + left, oy + top, width, height,
+                                                 surfBuf, surfInfo[0], left, top)
+                        return
+                self._deliverBitmap(ox + left, oy + top, width, height, 32,
+                                    bgra_arr.tobytes())
         except Exception as e:
             log.warning("RDPGFX: AVC420 decode error: %s" % e)
             self._onAvcNoOutput()
@@ -1190,16 +1202,17 @@ class DrdynvcLayer(LayerAutomata):
             self._avcSoftResetCount = 0   # reset soft-reset counter on success
             self._auxDecoderBrokenTime = 0.0  # aux decoder working; cancel broken timer
             self._blitToSurface(surfaceId, left, top, width, height, bgra_arr)
-            ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
-            if self._gfxSurfaceCallback is not None:
-                surfInfo = self._surfaces.get(surfaceId)
-                surfBuf = self._surfaceData.get(surfaceId)
-                if surfInfo is not None and surfBuf is not None:
-                    self._gfxSurfaceCallback(ox + left, oy + top, width, height,
-                                             surfBuf, surfInfo[0], left, top)
-                    return
-            self._deliverBitmap(ox + left, oy + top, width, height, 32,
-                                bgra_arr.tobytes())
+            if surfaceId in self._surfaceOutputMap:
+                ox, oy = self._surfaceOutputMap[surfaceId]
+                if self._gfxSurfaceCallback is not None:
+                    surfInfo = self._surfaces.get(surfaceId)
+                    surfBuf = self._surfaceData.get(surfaceId)
+                    if surfInfo is not None and surfBuf is not None:
+                        self._gfxSurfaceCallback(ox + left, oy + top, width, height,
+                                                 surfBuf, surfInfo[0], left, top)
+                        return
+                self._deliverBitmap(ox + left, oy + top, width, height, 32,
+                                    bgra_arr.tobytes())
         except Exception as e:
             log.warning("RDPGFX: AVC444 decode error: %s" % e)
             self._onAvcNoOutput()
@@ -1333,8 +1346,9 @@ class DrdynvcLayer(LayerAutomata):
         # Also update the surface buffer so cache operations work
         self._blitToSurface(surfaceId, left, top, width, height, raw)
 
-        ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
-        self._deliverBitmap(ox + left, oy + top, width, height, bpp, bytes(raw))
+        if surfaceId in self._surfaceOutputMap:
+            ox, oy = self._surfaceOutputMap[surfaceId]
+            self._deliverBitmap(ox + left, oy + top, width, height, bpp, bytes(raw))
 
     # ---------------------------------------------------------------
     # Planar codec (0x0004) — ported from grdp decodePlanar
@@ -1344,8 +1358,9 @@ class DrdynvcLayer(LayerAutomata):
         """Decode Planar bitmap (codec 0x0004) per MS-RDPEGDI 2.2.2.5."""
         out = self._decodePlanar(data, width, height)
         self._blitToSurface(surfaceId, left, top, width, height, out)
-        ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
-        self._deliverBitmap(ox + left, oy + top, width, height, 32, bytes(out))
+        if surfaceId in self._surfaceOutputMap:
+            ox, oy = self._surfaceOutputMap[surfaceId]
+            self._deliverBitmap(ox + left, oy + top, width, height, 32, bytes(out))
 
     def _decodePlanar(self, data, w, h):
         """Decode one Planar-codec bitmap; returns BGRA bytearray (w*h*4)."""
@@ -1488,8 +1503,9 @@ class DrdynvcLayer(LayerAutomata):
         if out is None:
             return
         self._blitToSurface(surfaceId, left, top, width, height, out)
-        ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
-        self._deliverBitmap(ox + left, oy + top, width, height, 32, bytes(out))
+        if surfaceId in self._surfaceOutputMap:
+            ox, oy = self._surfaceOutputMap[surfaceId]
+            self._deliverBitmap(ox + left, oy + top, width, height, 32, bytes(out))
 
     def _resetClearCodecVBar(self):
         self._ccVBarStorage = [None] * 32768
@@ -1896,7 +1912,9 @@ class DrdynvcLayer(LayerAutomata):
 
         surfW = surfInfo[0]
         surfH = surfInfo[1]
-        ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
+        is_mapped = surfaceId in self._surfaceOutputMap
+        if is_mapped:
+            ox, oy = self._surfaceOutputMap[surfaceId]
 
         # Numpy views for fast blit
         try:
@@ -1916,7 +1934,8 @@ class DrdynvcLayer(LayerAutomata):
             dest_coords.append((dx, dy))
 
             self._blitToSurface(surfaceId, dx, dy, cw, ch, cdata)
-            self._deliverBitmap(ox + dx, oy + dy, cw, ch, 32, bytes(cdata))
+            if is_mapped:
+                self._deliverBitmap(ox + dx, oy + dy, cw, ch, 32, bytes(cdata))
 
         first_coords = ", ".join("(%d,%d)" % (dx, dy) for dx, dy in dest_coords[:5])
         log.debug("RDPGFX: CACHETOSURFACE slot=%d surf=%d points=%d %dx%d first=[%s]%s" %
@@ -1945,12 +1964,14 @@ class DrdynvcLayer(LayerAutomata):
         """Deliver decoded Progressive tiles for a surface to the observer."""
         if (self._gfxCallback is None and self._gfxSurfaceCallback is None) or not rects:
             return
+        if surfaceId not in self._surfaceOutputMap:
+            return
         surfInfo = self._surfaces.get(surfaceId)
         surfBuf = self._surfaceData.get(surfaceId)
         if surfInfo is None or surfBuf is None:
             return
         surfW, surfH, _ = surfInfo
-        ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
+        ox, oy = self._surfaceOutputMap[surfaceId]
 
         # Numpy view of surface for fast region extraction fallback
         try:
