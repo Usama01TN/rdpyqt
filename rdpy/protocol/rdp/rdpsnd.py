@@ -41,13 +41,9 @@ import rdpy.core.log as log
 
 # Prebuffer duration in seconds.  The sink is not started until this much
 # PCM data has accumulated.  This keeps the ring buffer ahead of the Qt
-# audio thread so that normal per-packet jitter (~±25 ms) never causes an
-# underrun.  Standard RDP wave packets are ~186 ms at 44100 Hz stereo
-# 16-bit (32768 bytes), so ~120 ms of prebuffer plus the in-flight chunk
-# absorbs the observed jitter while keeping audio close to the video
-# (each 100 ms of prebuffer adds 100 ms of A/V offset on streams such as
-# YouTube, where the server emits picture and sound in lockstep).
-_AUDIO_PREBUF_SECONDS = 0.12
+# audio thread so that normal per-packet jitter (~±25 ms) and video decode
+# bursts never cause an underrun.
+_AUDIO_PREBUF_SECONDS = 0.25
 
 # Crossfade length in sample frames.  At 44100 Hz stereo 16-bit
 # (frame = 4 bytes), 128 frames ≈ 2.9 ms — short enough to be

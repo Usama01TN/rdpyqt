@@ -205,6 +205,10 @@ class DrdynvcLayer(LayerAutomata):
         self._auxDecoderBrokenTime = 0.0 # monotonic; when LC=2 aux decoder first went stuck (0=ok)
         self._decoderBrokenCallback = None
         self._avc444Disabled = False
+        # Queue depth hint for flow control (MS-RDPEGFX 2.2.2.8)
+        # Tells the server to pace video frame rate and bitrate, preventing
+        # the single-threaded reactor from being flooded and starving audio.
+        self._queueDepthHint = 15
         # Bitmap cache: cacheSlot -> (width, height, bytearray BGRA data)
         self._gfxCache = {}
         # ClearCodec VBAR and glyph caches (persistent across decode calls, matching grdp)
@@ -1951,16 +1955,19 @@ class DrdynvcLayer(LayerAutomata):
         """Send RDPGFX FRAME_ACKNOWLEDGE PDU."""
         if self._gfxChannelId is None:
             return
-        # FRAME_ACKNOWLEDGE payload: queueDepth(4) + frameId(4) + totalFramesDecoded(4)
-        ackPayload = struct.pack('<III', 0, frameId, self._totalFramesDecoded)
+        # Flow control: report queueDepth to the server so it paces frame rate
+        # and encoding quality to match client decoding capacity, preventing
+        # audio starvation and choppy video playback (MS-RDPEGFX 2.2.2.8).
+        queueDepth = self._queueDepthHint
+        ackPayload = struct.pack('<III', queueDepth, frameId, self._totalFramesDecoded)
         pduLen = 8 + len(ackPayload)
         gfxPdu = struct.pack('<HHI', RDPGFX_CMDID_FRAMEACKNOWLEDGE, 0, pduLen)
         gfxPdu += ackPayload
 
         cbId = self._channelCbId.get(self._gfxChannelId, 0)
         self._sendDvcData(self._gfxChannelId, cbId, gfxPdu)
-        log.debug("RDPGFX: sent FRAME_ACKNOWLEDGE frameId=%d total=%d" %
-                  (frameId, self._totalFramesDecoded))
+        log.debug("RDPGFX: sent FRAME_ACKNOWLEDGE frameId=%d total=%d queueDepth=%d" %
+                  (frameId, self._totalFramesDecoded, queueDepth))
 
     # ---------------------------------------------------------------
     # RDPGFX CAPS_ADVERTISE
