@@ -1197,16 +1197,14 @@ class DrdynvcLayer(LayerAutomata):
 
         null_count = self._avcDecoder.null_count if self._avcDecoder else 0
         count_triggered = null_count >= self._AVC_NULL_FRAME_THRESHOLD
-        time_triggered = frozen_for >= self._AVC_FREEZE_THRESHOLD
 
-        if not (count_triggered or time_triggered):
+        if not count_triggered:
             return
 
         if now - self._avcLastRefreshTime < self._AVC_REFRESH_COOLDOWN:
             return  # Cooldown: avoid spamming the server
 
-        trigger_reason = ('time(%.1fs)' % frozen_for if time_triggered
-                          else 'count(%d)' % null_count)
+        trigger_reason = 'count(%d)' % null_count
         log.debug("RDPGFX: AVC stall [%s], soft-resetting decoder and requesting refresh"
                   % trigger_reason)
         self._avcLastRefreshTime = now
