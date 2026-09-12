@@ -28,6 +28,8 @@ _FULL_TILE_COEFF_IDX = np.arange(RFX_TILE_SIZE * RFX_TILE_SIZE, dtype=np.int32)
 # Sub-band sizes in RLGR decode order:
 # HL1(1024) LH1(1024) HH1(1024) HL2(256) LH2(256) HH2(256) HL3(64) LH3(64) HH3(64) LL3(64)
 _SUBBAND_SIZES = [1024, 1024, 1024, 256, 256, 256, 64, 64, 64, 64]
+# Sub-band sizes for extrapolated DWT (RFX_DWT_REDUCE_EXTRAPOLATE):
+_SUBBAND_SIZES_EXT = [1023, 1023, 961, 272, 272, 256, 72, 72, 64, 81]
 
 
 # ---------------------------------------------------------------
@@ -141,20 +143,20 @@ class RfxQuant:
     __slots__ = ('LL3', 'LH3', 'HL3', 'HH3', 'LH2', 'HL2', 'HH2', 'LH1', 'HL1', 'HH1')
 
     def __init__(self, data):
-        # byte 0: LL3 (low), LH3 (high)
+        # byte 0: LL3 (low), HL3 (high)
         self.LL3 = data[0] & 0x0F
-        self.LH3 = data[0] >> 4
-        # byte 1: HL3 (low), HH3 (high)
-        self.HL3 = data[1] & 0x0F
+        self.HL3 = data[0] >> 4
+        # byte 1: LH3 (low), HH3 (high)
+        self.LH3 = data[1] & 0x0F
         self.HH3 = data[1] >> 4
-        # byte 2: LH2 (low), HL2 (high)
-        self.LH2 = data[2] & 0x0F
-        self.HL2 = data[2] >> 4
-        # byte 3: HH2 (low), LH1 (high)
+        # byte 2: HL2 (low), LH2 (high)
+        self.HL2 = data[2] & 0x0F
+        self.LH2 = data[2] >> 4
+        # byte 3: HH2 (low), HL1 (high)
         self.HH2 = data[3] & 0x0F
-        self.LH1 = data[3] >> 4
-        # byte 4: HL1 (low), HH1 (high)
-        self.HL1 = data[4] & 0x0F
+        self.HL1 = data[3] >> 4
+        # byte 4: LH1 (low), HH1 (high)
+        self.LH1 = data[4] & 0x0F
         self.HH1 = data[4] >> 4
 
     @staticmethod
@@ -174,36 +176,75 @@ class RfxQuant:
 
 class ProgQuant:
     """RFX_PROGRESSIVE_CODEC_QUANT: 16-byte progressive quant entry."""
-    __slots__ = ('y', 'cb', 'cr', 'quality')
+    __slots__ = ('quality', 'y', 'cb', 'cr')
 
     def __init__(self, data):
-        self.y = RfxQuant(data[0:5])
-        self.cb = RfxQuant(data[5:10])
-        self.cr = RfxQuant(data[10:15])
-        self.quality = data[15]
+        self.quality = data[0]
+        self.y = RfxQuant(data[1:6])
+        self.cb = RfxQuant(data[6:11])
+        self.cr = RfxQuant(data[11:16])
 
 
-@functools.lru_cache(maxsize=128)
-def _make_shift_arr(hl1, lh1, hh1, hl2, lh2, hh2, hl3, lh3, hh3, ll3):
-    """Build and cache the per-coefficient shift array for dequantization.
-
-    Called once per unique set of quantization values (typically constant within
-    a session) and then reused from the cache on every subsequent tile decode.
-    """
-    factors = np.array([hl1, lh1, hh1, hl2, lh2, hh2, hl3, lh3, hh3, ll3],
-                       dtype=np.int16)
-    shifts = np.maximum(factors - 1, 0)
-    if not np.any(shifts > 0):
-        return None
-    return np.repeat(shifts, _SUBBAND_SIZES)
+def _shift_val(v):
+    return (v - 1) if v > 0 else 0
 
 
-def _dequantize(coeffs, q):
-    """Apply dequantization (left-shift by factor-1) per subband — vectorized."""
-    shift_arr = _make_shift_arr(q.HL1, q.LH1, q.HH1, q.HL2, q.LH2, q.HH2,
-                                q.HL3, q.LH3, q.HH3, q.LL3)
-    if shift_arr is not None:
-        coeffs <<= shift_arr
+def _prog_quant_shift(q, pq=None, has_pq=False):
+    res = object.__new__(RfxQuant)
+    if not has_pq or pq is None:
+        res.LL3 = _shift_val(q.LL3)
+        res.HL3 = _shift_val(q.HL3)
+        res.LH3 = _shift_val(q.LH3)
+        res.HH3 = _shift_val(q.HH3)
+        res.HL2 = _shift_val(q.HL2)
+        res.LH2 = _shift_val(q.LH2)
+        res.HH2 = _shift_val(q.HH2)
+        res.HL1 = _shift_val(q.HL1)
+        res.LH1 = _shift_val(q.LH1)
+        res.HH1 = _shift_val(q.HH1)
+    else:
+        res.LL3 = _shift_val(q.LL3 + pq.LL3)
+        res.HL3 = _shift_val(q.HL3 + pq.HL3)
+        res.LH3 = _shift_val(q.LH3 + pq.LH3)
+        res.HH3 = _shift_val(q.HH3 + pq.HH3)
+        res.HL2 = _shift_val(q.HL2 + pq.HL2)
+        res.LH2 = _shift_val(q.LH2 + pq.LH2)
+        res.HH2 = _shift_val(q.HH2 + pq.HH2)
+        res.HL1 = _shift_val(q.HL1 + pq.HL1)
+        res.LH1 = _shift_val(q.LH1 + pq.LH1)
+        res.HH1 = _shift_val(q.HH1 + pq.HH1)
+    return res
+
+
+def _quant_add(q1, q2):
+    q = object.__new__(RfxQuant)
+    q.LL3 = q1.LL3 + q2.LL3
+    q.HL3 = q1.HL3 + q2.HL3
+    q.LH3 = q1.LH3 + q2.LH3
+    q.HH3 = q1.HH3 + q2.HH3
+    q.HL2 = q1.HL2 + q2.HL2
+    q.LH2 = q1.LH2 + q2.LH2
+    q.HH2 = q1.HH2 + q2.HH2
+    q.HL1 = q1.HL1 + q2.HL1
+    q.LH1 = q1.LH1 + q2.LH1
+    q.HH1 = q1.HH1 + q2.HH1
+    return q
+
+
+def _quant_sub(q1, q2):
+    q = object.__new__(RfxQuant)
+    sub = lambda a, b: max(0, a - b)
+    q.LL3 = sub(q1.LL3, q2.LL3)
+    q.HL3 = sub(q1.HL3, q2.HL3)
+    q.LH3 = sub(q1.LH3, q2.LH3)
+    q.HH3 = sub(q1.HH3, q2.HH3)
+    q.HL2 = sub(q1.HL2, q2.HL2)
+    q.LH2 = sub(q1.LH2, q2.LH2)
+    q.HH2 = sub(q1.HH2, q2.HH2)
+    q.HL1 = sub(q1.HL1, q2.HL1)
+    q.LH1 = sub(q1.LH1, q2.LH1)
+    q.HH1 = sub(q1.HH1, q2.HH1)
+    return q
 
 
 # ---------------------------------------------------------------
@@ -270,6 +311,162 @@ def _idwt_2d_level(buf, n):
     buf[:size * size] = out.reshape(-1)
 
 
+def _clampi16(val):
+    if val < -32768:
+        return -32768
+    if val > 32767:
+        return 32767
+    return val
+
+
+def _trunc_div2(x):
+    """Integer division by 2 truncating towards zero, matching C/Go (x / 2)."""
+    return (x // 2) if x >= 0 else -(-x // 2)
+
+
+def _idwt_x(p_low, p_high, p_dst, n_low_step, n_high_step, n_dst_step, n_low_count, n_high_count, n_dst_count):
+    for i in range(n_dst_count):
+        p_l = i * n_low_step
+        p_h = i * n_high_step
+        p_x = i * n_dst_step
+
+        H0 = int(p_high[p_h])
+        p_h += 1
+        L0 = int(p_low[p_l])
+        p_l += 1
+
+        X0 = _clampi16(L0 - H0)
+        X2 = X0
+
+        for j in range(n_high_count - 1):
+            H1 = int(p_high[p_h])
+            p_h += 1
+            L0 = int(p_low[p_l])
+            p_l += 1
+            X2 = _clampi16(L0 - _trunc_div2(H0 + H1))
+            X1 = _clampi16(_trunc_div2(X0 + X2) + (2 * H0))
+            p_dst[p_x] = X0
+            p_dst[p_x + 1] = X1
+            p_x += 2
+            X0 = X2
+            H0 = H1
+
+        if n_low_count <= n_high_count + 1:
+            if n_low_count <= n_high_count:
+                p_dst[p_x] = X2
+                p_dst[p_x + 1] = _clampi16(X2 + 2 * H0)
+            else:
+                L0 = int(p_low[p_l])
+                p_l += 1
+                X0 = _clampi16(L0 - H0)
+                p_dst[p_x] = X2
+                p_dst[p_x + 1] = _clampi16(_trunc_div2(X0 + X2) + 2 * H0)
+                p_dst[p_x + 2] = X0
+        else:
+            L0 = int(p_low[p_l])
+            p_l += 1
+            X0 = _clampi16(L0 - _trunc_div2(H0))
+            p_dst[p_x] = X2
+            p_dst[p_x + 1] = _clampi16(_trunc_div2(X0 + X2) + 2 * H0)
+            p_dst[p_x + 2] = X0
+            L0 = int(p_low[p_l])
+            p_dst[p_x + 3] = _clampi16(_trunc_div2(X0 + L0))
+
+
+def _idwt_y(p_low, p_high, p_dst, n_low_step, n_high_step, n_dst_step, n_low_count, n_high_count, n_dst_count):
+    for i in range(n_dst_count):
+        p_l = i
+        p_h = i
+        p_x = i
+
+        H0 = int(p_high[p_h])
+        p_h += n_high_step
+        L0 = int(p_low[p_l])
+        p_l += n_low_step
+
+        X0 = _clampi16(L0 - H0)
+        X2 = X0
+
+        for j in range(n_high_count - 1):
+            H1 = int(p_high[p_h])
+            p_h += n_high_step
+            L0 = int(p_low[p_l])
+            p_l += n_low_step
+            X2 = _clampi16(L0 - _trunc_div2(H0 + H1))
+            X1 = _clampi16(_trunc_div2(X0 + X2) + 2 * H0)
+            p_dst[p_x] = X0
+            p_x += n_dst_step
+            p_dst[p_x] = X1
+            p_x += n_dst_step
+            X0 = X2
+            H0 = H1
+
+        if n_low_count <= n_high_count + 1:
+            if n_low_count <= n_high_count:
+                p_dst[p_x] = X2
+                p_x += n_dst_step
+                p_dst[p_x] = _clampi16(X2 + 2 * H0)
+            else:
+                L0 = int(p_low[p_l])
+                p_l += n_low_step
+                X0 = _clampi16(L0 - H0)
+                p_dst[p_x] = X2
+                p_x += n_dst_step
+                p_dst[p_x] = _clampi16(_trunc_div2(X0 + X2) + 2 * H0)
+                p_x += n_dst_step
+                p_dst[p_x] = X0
+        else:
+            L0 = int(p_low[p_l])
+            p_l += n_low_step
+            X0 = _clampi16(L0 - _trunc_div2(H0))
+            p_dst[p_x] = X2
+            p_x += n_dst_step
+            p_dst[p_x] = _clampi16(_trunc_div2(X0 + X2) + 2 * H0)
+            p_x += n_dst_step
+            p_dst[p_x] = X0
+            p_x += n_dst_step
+            L0 = int(p_low[p_l])
+            p_dst[p_x] = _clampi16(_trunc_div2(X0 + L0))
+
+
+def _dwt_2d_decode_block(buffer, temp, level):
+    n_band_l = (64 >> level) + 1
+    if level == 1:
+        n_band_h = (64 >> 1) - 1
+    else:
+        n_band_h = (64 + (1 << (level - 1))) >> level
+
+    offset = 0
+    hl = buffer[offset:offset + n_band_h * n_band_l]
+    offset += n_band_h * n_band_l
+    lh = buffer[offset:offset + n_band_l * n_band_h]
+    offset += n_band_l * n_band_h
+    hh = buffer[offset:offset + n_band_h * n_band_h]
+    offset += n_band_h * n_band_h
+    ll = buffer[offset:offset + n_band_l * n_band_l]
+
+    n_dst_step = n_band_l + n_band_h
+
+    temp_l = temp[0:n_band_l * n_dst_step]
+    temp_h = temp[n_band_l * n_dst_step:(n_band_l + n_band_h) * n_dst_step]
+
+    # horizontal (LL + HL -> L)
+    _idwt_x(ll, hl, temp_l, n_band_l, n_band_h, n_dst_step, n_band_l, n_band_h, n_band_l)
+
+    # horizontal (LH + HH -> H)
+    _idwt_x(lh, hh, temp_h, n_band_l, n_band_h, n_dst_step, n_band_l, n_band_h, n_band_h)
+
+    # vertical (L + H -> buffer)
+    _idwt_y(temp_l, temp_h, buffer, n_dst_step, n_dst_step, n_dst_step, n_band_l, n_band_h, n_band_l + n_band_h)
+
+
+def _inverse_dwt_extrapolate(buffer):
+    temp = np.zeros(4096, dtype=np.int16)
+    _dwt_2d_decode_block(buffer[3807:], temp, 3)
+    _dwt_2d_decode_block(buffer[3007:], temp, 2)
+    _dwt_2d_decode_block(buffer[0:], temp, 1)
+
+
 def _inverse_dwt_2d(coeffs):
     """3-level inverse 2D DWT in-place."""
     _idwt_2d_level(coeffs[3840:], 8)   # Level 3: 8×8 → 16×16
@@ -281,33 +478,39 @@ def _inverse_dwt_2d(coeffs):
 # Component decoding
 # ---------------------------------------------------------------
 
-def _decode_component(data, quant, store=False):
-    """Decode one color component (Y/Cb/Cr) for a 64×64 tile.
-
-    If store=True, also returns (raw_coeffs, sign_context) needed for
-    progressive upgrade (pre-dequantization values).
-    """
+def _decode_component(data, shift, prev_dequant=None, is_diff=False, extrapolate=False):
+    """Decode one color component (Y/Cb/Cr) for a 64×64 tile."""
     TILE_PIXELS = RFX_TILE_SIZE * RFX_TILE_SIZE  # 4096
 
-    # 1. RLGR1 entropy decode
-    coeffs = rlgr1_decode(data, TILE_PIXELS)
+    if data:
+        coeffs = rlgr1_decode(data, TILE_PIXELS)
+        raw_sign = coeffs.copy()
+    else:
+        coeffs = np.zeros(TILE_PIXELS, dtype=np.int16)
+        raw_sign = np.zeros(TILE_PIXELS, dtype=np.int16)
 
-    # 2. Differential decode LL3 (positions 4032..4095) using numpy cumsum
-    coeffs[4032:4096] = np.cumsum(coeffs[4032:4096], dtype=np.int16)
+    if not extrapolate:
+        # Differential decode LL3 (positions 4032..4095)
+        coeffs[4032:4096] = np.cumsum(coeffs[4032:4096], dtype=np.int16)
+        shift_arr = np.repeat(np.array(shift.subband_shifts(), dtype=np.int16), _SUBBAND_SIZES)
+        coeffs <<= shift_arr
+    else:
+        # Differential decode LL3 (positions 4015..4095)
+        coeffs[4015:4096] = np.cumsum(coeffs[4015:4096], dtype=np.int16)
+        shift_arr = np.repeat(np.array(shift.subband_shifts(), dtype=np.int16), _SUBBAND_SIZES_EXT)
+        coeffs <<= shift_arr
 
-    if store:
-        raw = coeffs.copy()
-        sign = np.sign(raw).astype(np.int8)
+    if is_diff and prev_dequant is not None:
+        coeffs += prev_dequant
 
-    # 3. Dequantize
-    _dequantize(coeffs, quant)
+    dequant = coeffs.copy()
+    work = coeffs.copy()
+    if not extrapolate:
+        _inverse_dwt_2d(work)
+    else:
+        _inverse_dwt_extrapolate(work)
 
-    # 4. Inverse DWT (3 levels)
-    _inverse_dwt_2d(coeffs)
-
-    if store:
-        return coeffs, raw, sign
-    return coeffs
+    return work, dequant, raw_sign
 
 
 # ---------------------------------------------------------------
@@ -323,7 +526,6 @@ def _place_tile_abs(y_coeffs, cb_coeffs, cr_coeffs, tile_x, tile_y, output, out_
 
     # Build flat index into 64-wide coefficient arrays
     if tile_w == RFX_TILE_SIZE and tile_h == RFX_TILE_SIZE:
-        # Full tile — direct contiguous astype() is faster than fancy indexing
         y_arr = y_coeffs.astype(np.int32)
         cb_arr = cb_coeffs.astype(np.int32)
         cr_arr = cr_coeffs.astype(np.int32)
@@ -380,54 +582,145 @@ def _place_tile(y_coeffs, cb_coeffs, cr_coeffs, x_idx, y_idx, output, out_w, out
 # SRL + RAW bit-level reader for progressive upgrades
 # ---------------------------------------------------------------
 
-def _upgrade_component(srl_data, raw_data, current, sign, quant, prog_quant):
-    """Apply progressive upgrade delta to stored coefficients.
-    Uses SRL+RAW bit-level decoding per MS-RDPEGFX 3.3.8.4.
+class _BitStream:
+    def __init__(self, data):
+        self.data = data or b''
+        self.pos = 0
+        self.bits = 0
+        self.bit_len = 0
+        self._fill()
 
-    current: stored raw (pre-dequant) coefficients (int16, modified in-place)
-    sign: stored sign context (int8, modified in-place)
-    quant: regular quant values for dequantization
-    prog_quant: progressive quant values (bit positions)
-    """
-    srl = _BitReader(srl_data)
-    raw = _BitReader(raw_data)
+    def _fill(self):
+        while self.bit_len <= 56 and self.pos < len(self.data):
+            self.bits |= (self.data[self.pos] << (56 - self.bit_len))
+            self.pos += 1
+            self.bit_len += 8
 
-    shifts = quant.subband_shifts()
-    bit_positions = prog_quant.subband_shifts()
+    def read_bit(self):
+        if self.bit_len < 1:
+            self._fill()
+            if self.bit_len < 1:
+                return 0
+        bit = (self.bits >> 63) & 1
+        self.bits = (self.bits << 1) & 0xFFFFFFFFFFFFFFFF
+        self.bit_len -= 1
+        return bit
 
-    offset = 0
-    for band_idx, band_size in enumerate(_SUBBAND_SIZES):
-        shift = shifts[band_idx]
-        bit_pos = bit_positions[band_idx]
-        n_bits = max(0, shift - bit_pos)
+    def read_bits(self, n):
+        if n <= 0:
+            return 0
+        if self.bit_len < n:
+            self._fill()
+            if self.bit_len < n:
+                n = self.bit_len
+                if n <= 0:
+                    return 0
+        val = (self.bits >> (64 - n)) & ((1 << n) - 1)
+        self.bits = (self.bits << n) & 0xFFFFFFFFFFFFFFFF
+        self.bit_len -= n
+        return val
 
-        # Process band: separate known-sign and unknown-sign elements
-        for i in range(offset, offset + band_size):
-            if sign[i] != 0:
-                mag = raw.read_bits(n_bits) if n_bits > 0 else 0
-                if sign[i] > 0:
-                    current[i] += mag
-                else:
-                    current[i] -= mag
+
+class _SRLState:
+    def __init__(self, srl_data, raw_data):
+        self.srl = _BitStream(srl_data)
+        self.raw = _BitStream(raw_data)
+        self.kp = 8
+        self.nz = 0
+        self.mode = False
+
+    def read_srl(self, num_bits):
+        if self.nz > 0:
+            self.nz -= 1
+            return 0
+        k = self.kp // 8
+        if not self.mode:
+            bit = self.srl.read_bit()
+            if bit == 0:
+                self.nz = (1 << k) - 1
+                self.kp += 4
+                if self.kp > 80:
+                    self.kp = 80
+                return 0
             else:
-                if srl.read_bit():
-                    mag = raw.read_bits(n_bits) if n_bits > 0 else 0
-                    if srl.read_bit():
-                        current[i] = -mag
-                        sign[i] = -1
-                    else:
-                        current[i] = mag
-                        sign[i] = 1
+                self.nz = 0
+                self.mode = True
+                if k > 0:
+                    self.nz = self.srl.read_bits(k)
+                if self.nz > 0:
+                    self.nz -= 1
+                    return 0
+        self.mode = False
+        sign = self.srl.read_bit()
+        if self.kp < 6:
+            self.kp = 0
+        else:
+            self.kp -= 6
+        if num_bits == 1:
+            return -1 if sign != 0 else 1
+        mag = 1
+        max_val = (1 << num_bits) - 1
+        while mag < max_val:
+            bit = self.srl.read_bit()
+            if bit != 0:
+                break
+            mag += 1
+        return -mag if sign != 0 else mag
 
-        offset += band_size
+    def upgrade_block(self, current, sign, length, shift, num_bits, is_ll):
+        if num_bits == 0 or length > len(current) or length > len(sign):
+            return
+        if is_ll:
+            for i in range(length):
+                input_val = self.raw.read_bits(num_bits)
+                current[i] += np.int16(input_val << shift)
+            return
+        for i in range(length):
+            if sign[i] > 0:
+                input_val = self.raw.read_bits(num_bits)
+            elif sign[i] < 0:
+                input_val = -self.raw.read_bits(num_bits)
+            else:
+                srl_val = self.read_srl(num_bits)
+                sign[i] = srl_val
+                input_val = srl_val
+            current[i] += np.int16(input_val << shift)
 
 
-def _reconstruct_from_raw(raw_coeffs, quant):
-    """Dequantize + inverse DWT from raw (pre-dequant) coefficients."""
-    coeffs = raw_coeffs.astype(np.int16).copy()
-    _dequantize(coeffs, quant)
-    _inverse_dwt_2d(coeffs)
-    return coeffs
+def _upgrade_component(srl_data, raw_data, shift, num_bits, current, sign, extrapolate=False):
+    """Apply progressive upgrade delta to stored coefficients."""
+    state = _SRLState(srl_data, raw_data)
+    cur = current
+    sgn = sign
+    if not extrapolate:
+        state.upgrade_block(cur[0:1024], sgn[0:1024], 1024, shift.HL1, num_bits.HL1, False)
+        state.upgrade_block(cur[1024:2048], sgn[1024:2048], 1024, shift.LH1, num_bits.LH1, False)
+        state.upgrade_block(cur[2048:3072], sgn[2048:3072], 1024, shift.HH1, num_bits.HH1, False)
+        state.upgrade_block(cur[3072:3328], sgn[3072:3328], 256, shift.HL2, num_bits.HL2, False)
+        state.upgrade_block(cur[3328:3584], sgn[3328:3584], 256, shift.LH2, num_bits.LH2, False)
+        state.upgrade_block(cur[3584:3840], sgn[3584:3840], 256, shift.HH2, num_bits.HH2, False)
+        state.upgrade_block(cur[3840:3904], sgn[3840:3904], 64, shift.HL3, num_bits.HL3, False)
+        state.upgrade_block(cur[3904:3968], sgn[3904:3968], 64, shift.LH3, num_bits.LH3, False)
+        state.upgrade_block(cur[3968:4032], sgn[3968:4032], 64, shift.HH3, num_bits.HH3, False)
+        state.upgrade_block(cur[4032:4096], sgn[4032:4096], 64, shift.LL3, num_bits.LL3, True)
+    else:
+        state.upgrade_block(cur[0:1023], sgn[0:1023], 1023, shift.HL1, num_bits.HL1, False)
+        state.upgrade_block(cur[1023:2046], sgn[1023:2046], 1023, shift.LH1, num_bits.LH1, False)
+        state.upgrade_block(cur[2046:3007], sgn[2046:3007], 961, shift.HH1, num_bits.HH1, False)
+        state.upgrade_block(cur[3007:3279], sgn[3007:3279], 272, shift.HL2, num_bits.HL2, False)
+        state.upgrade_block(cur[3279:3551], sgn[3279:3551], 272, shift.LH2, num_bits.LH2, False)
+        state.upgrade_block(cur[3551:3807], sgn[3551:3807], 256, shift.HH2, num_bits.HH2, False)
+        state.upgrade_block(cur[3807:3879], sgn[3807:3879], 72, shift.HL3, num_bits.HL3, False)
+        state.upgrade_block(cur[3879:3951], sgn[3879:3951], 72, shift.LH3, num_bits.LH3, False)
+        state.upgrade_block(cur[3951:4015], sgn[3951:4015], 64, shift.HH3, num_bits.HH3, False)
+        state.upgrade_block(cur[4015:4096], sgn[4015:4096], 81, shift.LL3, num_bits.LL3, True)
+
+    work = cur.copy()
+    if not extrapolate:
+        _inverse_dwt_2d(work)
+    else:
+        _inverse_dwt_extrapolate(work)
+    return work
 
 
 # ---------------------------------------------------------------
@@ -516,6 +809,8 @@ class RfxProgressiveDecoder:
             log.debug("RFX:   quant[%d] LL3=%d LH3=%d HL3=%d HH3=%d LH2=%d HL2=%d HH2=%d LH1=%d HL1=%d HH1=%d" %
                       (i, q.LL3, q.LH3, q.HL3, q.HH3, q.LH2, q.HL2, q.HH2, q.LH1, q.HL1, q.HH1))
 
+        extrapolate = (flags & 0x01) != 0
+
         tile_positions = []
         for _ in range(num_tiles):
             if offset + 6 > len(data):
@@ -533,12 +828,12 @@ class RfxProgressiveDecoder:
                 tile_positions.append((tx, ty))
 
             if tile_type == PROG_WBT_TILE_SIMPLE:
-                self._decode_tile_simple(tile_data, quants, output, width, height)
+                self._decode_tile_simple(tile_data, quants, output, width, height, extrapolate)
             elif tile_type == PROG_WBT_TILE_FIRST:
-                self._decode_tile_first(tile_data, quants, output, width, height)
+                self._decode_tile_first(tile_data, quants, prog_quants, output, width, height, extrapolate)
             elif tile_type == PROG_WBT_TILE_UPGRADE:
                 self._decode_tile_upgrade(tile_data, quants, prog_quants,
-                                          output, width, height)
+                                          output, width, height, extrapolate)
 
             offset += tile_len
 
@@ -566,14 +861,17 @@ class RfxProgressiveDecoder:
             return quants[idx]
         return RfxQuant.default()
 
-    def _decode_tile_simple(self, data, quants, output, out_w, out_h):
+    def _decode_tile_simple(self, data, quants, output, out_w, out_h, extrapolate=False):
         if len(data) < 16:
             return
         quant_idx_y = data[0]
         quant_idx_cb = data[1]
         quant_idx_cr = data[2]
         x_idx, y_idx = struct.unpack_from('<HH', data, 3)
+        flags = data[7]
         y_len, cb_len, cr_len = struct.unpack_from('<HHH', data, 8)
+
+        is_diff = (flags & 0x01) != 0
 
         off = 16
         y_data = data[off:off + y_len] if y_len > 0 else None
@@ -586,38 +884,48 @@ class RfxProgressiveDecoder:
         q_cb = self._get_quant(quants, quant_idx_cb)
         q_cr = self._get_quant(quants, quant_idx_cr)
 
+        shift_y = _prog_quant_shift(q_y)
+        shift_cb = _prog_quant_shift(q_cb)
+        shift_cr = _prog_quant_shift(q_cr)
+
+        key = (x_idx, y_idx)
+        prev_y = prev_cb = prev_cr = None
+        if is_diff and key in self._tileState:
+            prev_y = self._tileState[key]['y']
+            prev_cb = self._tileState[key]['cb']
+            prev_cr = self._tileState[key]['cr']
+
         if self._debug_tile_count < 3:
-            log.debug("RFX: TILE_SIMPLE (%d,%d) yLen=%d cbLen=%d crLen=%d qY=%d qCb=%d qCr=%d" %
-                      (x_idx, y_idx, y_len, cb_len, cr_len,
+            log.debug("RFX: TILE_SIMPLE (%d,%d) isDiff=%s yLen=%d cbLen=%d crLen=%d qY=%d qCb=%d qCr=%d" %
+                      (x_idx, y_idx, is_diff, y_len, cb_len, cr_len,
                        quant_idx_y, quant_idx_cb, quant_idx_cr))
         self._debug_tile_count += 1
 
-        y_pixels, y_raw, y_sign = _decode_component(y_data, q_y, store=True)
-        cb_pixels, cb_raw, cb_sign = _decode_component(cb_data, q_cb, store=True)
-        cr_pixels, cr_raw, cr_sign = _decode_component(cr_data, q_cr, store=True)
-
-        if self._debug_tile_count <= 3:
-            # Sample center pixel (32,32) of the tile for debugging
-            idx = 32 * 64 + 32
-            log.debug("RFX:   tile(%d,%d) center Y=%d Cb=%d Cr=%d" %
-                      (x_idx, y_idx, int(y_pixels[idx]), int(cb_pixels[idx]), int(cr_pixels[idx])))
-
-        # Store tile state for potential future upgrades
-        self._tileState[(x_idx, y_idx)] = {
-            'y_raw': y_raw, 'cb_raw': cb_raw, 'cr_raw': cr_raw,
-            'y_sign': y_sign, 'cb_sign': cb_sign, 'cr_sign': cr_sign,
-        }
+        y_pixels, new_y, sign_y = _decode_component(y_data, shift_y, prev_y, is_diff, extrapolate)
+        cb_pixels, new_cb, sign_cb = _decode_component(cb_data, shift_cb, prev_cb, is_diff, extrapolate)
+        cr_pixels, new_cr, sign_cr = _decode_component(cr_data, shift_cr, prev_cr, is_diff, extrapolate)
 
         _place_tile(y_pixels, cb_pixels, cr_pixels, x_idx, y_idx, output, out_w, out_h)
 
-    def _decode_tile_first(self, data, quants, output, out_w, out_h):
+        self._tileState[key] = {
+            'y': new_y, 'cb': new_cb, 'cr': new_cr,
+            'sign_y': sign_y, 'sign_cb': sign_cb, 'sign_cr': sign_cr,
+            'y_bit_pos': q_y, 'cb_bit_pos': q_cb, 'cr_bit_pos': q_cr,
+            'quant_y': q_y, 'quant_cb': q_cb, 'quant_cr': q_cr,
+        }
+
+    def _decode_tile_first(self, data, quants, prog_quants, output, out_w, out_h, extrapolate=False):
         if len(data) < 17:
             return
         quant_idx_y = data[0]
         quant_idx_cb = data[1]
         quant_idx_cr = data[2]
         x_idx, y_idx = struct.unpack_from('<HH', data, 3)
+        flags = data[7]
+        quality = data[8]
         y_len, cb_len, cr_len = struct.unpack_from('<HHH', data, 9)
+
+        is_diff = (flags & 0x01) != 0
 
         off = 17
         y_data = data[off:off + y_len] if y_len > 0 else None
@@ -630,30 +938,47 @@ class RfxProgressiveDecoder:
         q_cb = self._get_quant(quants, quant_idx_cb)
         q_cr = self._get_quant(quants, quant_idx_cr)
 
+        pq = self._get_prog_quant(prog_quants, quality)
+        pq_y = pq.y if pq else None
+        pq_cb = pq.cb if pq else None
+        pq_cr = pq.cr if pq else None
+        has_pq = pq is not None
+
+        shift_y = _prog_quant_shift(q_y, pq_y, has_pq)
+        shift_cb = _prog_quant_shift(q_cb, pq_cb, has_pq)
+        shift_cr = _prog_quant_shift(q_cr, pq_cr, has_pq)
+
+        bit_pos_y = _quant_add(q_y, pq_y) if has_pq else q_y
+        bit_pos_cb = _quant_add(q_cb, pq_cb) if has_pq else q_cb
+        bit_pos_cr = _quant_add(q_cr, pq_cr) if has_pq else q_cr
+
+        key = (x_idx, y_idx)
+        prev_y = prev_cb = prev_cr = None
+        if is_diff and key in self._tileState:
+            prev_y = self._tileState[key]['y']
+            prev_cb = self._tileState[key]['cb']
+            prev_cr = self._tileState[key]['cr']
+
         if self._debug_tile_count < 3:
-            log.debug("RFX: TILE_FIRST (%d,%d) yLen=%d cbLen=%d crLen=%d qY=%d qCb=%d qCr=%d" %
-                      (x_idx, y_idx, y_len, cb_len, cr_len,
+            log.debug("RFX: TILE_FIRST (%d,%d) isDiff=%s quality=%d yLen=%d cbLen=%d crLen=%d qY=%d qCb=%d qCr=%d" %
+                      (x_idx, y_idx, is_diff, quality, y_len, cb_len, cr_len,
                        quant_idx_y, quant_idx_cb, quant_idx_cr))
         self._debug_tile_count += 1
 
-        y_pixels, y_raw, y_sign = _decode_component(y_data, q_y, store=True)
-        cb_pixels, cb_raw, cb_sign = _decode_component(cb_data, q_cb, store=True)
-        cr_pixels, cr_raw, cr_sign = _decode_component(cr_data, q_cr, store=True)
-
-        if self._debug_tile_count <= 3:
-            idx = 32 * 64 + 32
-            log.debug("RFX:   tile(%d,%d) center Y=%d Cb=%d Cr=%d" %
-                      (x_idx, y_idx, int(y_pixels[idx]), int(cb_pixels[idx]), int(cr_pixels[idx])))
-
-        # Store tile state for progressive upgrades
-        self._tileState[(x_idx, y_idx)] = {
-            'y_raw': y_raw, 'cb_raw': cb_raw, 'cr_raw': cr_raw,
-            'y_sign': y_sign, 'cb_sign': cb_sign, 'cr_sign': cr_sign,
-        }
+        y_pixels, new_y, sign_y = _decode_component(y_data, shift_y, prev_y, is_diff, extrapolate)
+        cb_pixels, new_cb, sign_cb = _decode_component(cb_data, shift_cb, prev_cb, is_diff, extrapolate)
+        cr_pixels, new_cr, sign_cr = _decode_component(cr_data, shift_cr, prev_cr, is_diff, extrapolate)
 
         _place_tile(y_pixels, cb_pixels, cr_pixels, x_idx, y_idx, output, out_w, out_h)
 
-    def _decode_tile_upgrade(self, data, quants, prog_quants, output, out_w, out_h):
+        self._tileState[key] = {
+            'y': new_y, 'cb': new_cb, 'cr': new_cr,
+            'sign_y': sign_y, 'sign_cb': sign_cb, 'sign_cr': sign_cr,
+            'y_bit_pos': bit_pos_y, 'cb_bit_pos': bit_pos_cb, 'cr_bit_pos': bit_pos_cr,
+            'quant_y': q_y, 'quant_cb': q_cb, 'quant_cr': q_cr,
+        }
+
+    def _decode_tile_upgrade(self, data, quants, prog_quants, output, out_w, out_h, extrapolate=False):
         """Decode a TILE_UPGRADE: apply progressive delta to stored tile state."""
         if len(data) < 20:
             return
@@ -674,28 +999,37 @@ class RfxProgressiveDecoder:
 
         key = (x_idx, y_idx)
         state = self._tileState.get(key)
-        if state is None:
-            return  # No previous state to upgrade
+        if state is None or 'y' not in state or 'sign_y' not in state:
+            return
 
         q_y = self._get_quant(quants, quant_idx_y)
         q_cb = self._get_quant(quants, quant_idx_cb)
         q_cr = self._get_quant(quants, quant_idx_cr)
 
-        # Get progressive quant by quality index
         pq = self._get_prog_quant(prog_quants, quality)
+        pq_y = pq.y if pq else None
+        pq_cb = pq.cb if pq else None
+        pq_cr = pq.cr if pq else None
 
-        # Apply upgrade deltas to stored coefficients
-        _upgrade_component(y_srl, y_raw, state['y_raw'], state['y_sign'],
-                           q_y, pq.y if pq else q_y)
-        _upgrade_component(cb_srl, cb_raw, state['cb_raw'], state['cb_sign'],
-                           q_cb, pq.cb if pq else q_cb)
-        _upgrade_component(cr_srl, cr_raw, state['cr_raw'], state['cr_sign'],
-                           q_cr, pq.cr if pq else q_cr)
+        new_y_bit_pos = _quant_add(q_y, pq_y) if pq_y else q_y
+        new_cb_bit_pos = _quant_add(q_cb, pq_cb) if pq_cb else q_cb
+        new_cr_bit_pos = _quant_add(q_cr, pq_cr) if pq_cr else q_cr
 
-        # Reconstruct from updated raw coefficients
-        y_pixels = _reconstruct_from_raw(state['y_raw'], q_y)
-        cb_pixels = _reconstruct_from_raw(state['cb_raw'], q_cb)
-        cr_pixels = _reconstruct_from_raw(state['cr_raw'], q_cr)
+        num_bits_y = _quant_sub(state['y_bit_pos'], new_y_bit_pos)
+        num_bits_cb = _quant_sub(state['cb_bit_pos'], new_cb_bit_pos)
+        num_bits_cr = _quant_sub(state['cr_bit_pos'], new_cr_bit_pos)
+
+        shift_y = _prog_quant_shift(new_y_bit_pos)
+        shift_cb = _prog_quant_shift(new_cb_bit_pos)
+        shift_cr = _prog_quant_shift(new_cr_bit_pos)
+
+        state['y_bit_pos'] = new_y_bit_pos
+        state['cb_bit_pos'] = new_cb_bit_pos
+        state['cr_bit_pos'] = new_cr_bit_pos
+
+        y_pixels = _upgrade_component(y_srl, y_raw, shift_y, num_bits_y, state['y'], state['sign_y'], extrapolate)
+        cb_pixels = _upgrade_component(cb_srl, cb_raw, shift_cb, num_bits_cb, state['cb'], state['sign_cb'], extrapolate)
+        cr_pixels = _upgrade_component(cr_srl, cr_raw, shift_cr, num_bits_cr, state['cr'], state['sign_cr'], extrapolate)
 
         _place_tile(y_pixels, cb_pixels, cr_pixels, x_idx, y_idx, output, out_w, out_h)
 

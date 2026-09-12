@@ -32,6 +32,7 @@ import rdpy.core.log as log
 from rdpy.protocol.rdp.rfx_progressive import RfxProgressiveDecoder
 from rdpy.protocol.rdp.rfx import RfxDecoder
 from rdpy.protocol.rdp.zgfx import ZgfxDecompressor
+from rdpy.protocol.rdp.nscodec import decode_nscodec
 from rdpy.protocol.rdp import avc as avc_module
 
 
@@ -107,6 +108,30 @@ RDPGFX_CAPVERSION_107 = 0x000A0701
 RDPGFX_CAPS_FLAG_THINCLIENT = 0x00000001
 RDPGFX_CAPS_FLAG_SMALL_CACHE = 0x00000002
 RDPGFX_CAPS_FLAG_AVC420_ENABLED = 0x00000010  # v8.1: explicitly enable AVC420
+
+# ClearCodec log2 floor table for palette bit calculation (MS-RDPEGFX 2.2.4.1.1.2)
+_CLEAR_LOG2_FLOOR = bytes([
+    0,
+    1, 1,
+    2, 2, 2, 2,
+    3, 3, 3, 3, 3, 3, 3, 3,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+])
 RDPGFX_CAPS_FLAG_AVC_DISABLED = 0x00000020    # v10+: disable AVC
 RDPGFX_CAPS_FLAG_AVC_THINCLIENT = 0x00000040  # v10.3+: AVC thin client
 
@@ -179,11 +204,13 @@ class DrdynvcLayer(LayerAutomata):
         self._lastLC2RecvTime = 0.0      # monotonic; time of most recent LC=2 frame arrival
         self._auxDecoderBrokenTime = 0.0 # monotonic; when LC=2 aux decoder first went stuck (0=ok)
         self._decoderBrokenCallback = None
+        self._avc444Disabled = False
         # Bitmap cache: cacheSlot -> (width, height, bytearray BGRA data)
         self._gfxCache = {}
-        # ClearCodec VBAR caches (persistent across decode calls, matching grdp)
+        # ClearCodec VBAR and glyph caches (persistent across decode calls, matching grdp)
         self._ccVBarStorage = [None] * 32768       # VBAR cache: list of (pixels_bytes, count)
         self._ccShortVBarStorage = [None] * 16384  # Short VBAR cache
+        self._ccGlyphStorage = {}                  # Glyph cache: glyphIndex -> BGRA bytes
         self._ccVBarCursor = 0
         self._ccShortVBarCursor = 0
         # Negotiated GFX version (set by CAPS_CONFIRM)
@@ -238,6 +265,10 @@ class DrdynvcLayer(LayerAutomata):
         should trigger a full RDP reconnect to restore video playback.
         """
         self._decoderBrokenCallback = callback
+
+    def setAVC444Disabled(self, disabled):
+        """Set whether AVC444 / AVC444v2 support is disabled."""
+        self._avc444Disabled = bool(disabled)
 
     def connect(self):
         log.debug("DrdynvcLayer.connect()")
@@ -678,9 +709,13 @@ class DrdynvcLayer(LayerAutomata):
         self._surfaces.clear()
         self._surfaceData.clear()
         self._surfaceOutputMap.clear()
+        self._gfxCache.clear()
+        # Reset RFX Progressive decoder state
+        self._rfxDecoder.reset()
         # Reset ClearCodec caches (matches grdp's onResetGraphics)
         self._ccVBarStorage = [None] * 32768
         self._ccShortVBarStorage = [None] * 16384
+        self._ccGlyphStorage.clear()
         self._ccVBarCursor = 0
         self._ccShortVBarCursor = 0
         # Reset H.264 decoder state (matches grdp's onResetGraphics)
@@ -784,7 +819,17 @@ class DrdynvcLayer(LayerAutomata):
         elif codecId in (RDPGFX_CODECID_PLANAR, RDPGFX_CODECID_PLANAR_V2):
             self._renderPlanar(surfaceId, left, top, width, height, bitmapData)
         elif codecId == RDPGFX_CODECID_CAPROGRESSIVE:
-            log.debug("RDPGFX: Progressive RemoteFX not yet supported, %d bytes" % len(bitmapData))
+            surfInfo = self._surfaces.get(surfaceId)
+            surfBuf = self._surfaceData.get(surfaceId)
+            if surfInfo is None or surfBuf is None:
+                log.warning("RDPGFX: WTS1 unknown surface %d" % surfaceId)
+                return
+            w, h, fmt = surfInfo
+            try:
+                rects = self._rfxDecoder.decode(bitmapData, surfBuf, w, h)
+                self._deliverSurfaceBitmap(surfaceId, rects)
+            except Exception as e:
+                log.warning("RDPGFX: Progressive decode error (WTS1): %s" % str(e))
         elif codecId == RDPGFX_CODECID_CLEARCODEC:
             self._renderClearCodec(surfaceId, left, top, width, height,
                                    pixelFormat, bitmapData)
@@ -1262,38 +1307,82 @@ class DrdynvcLayer(LayerAutomata):
             return out
 
         header = data[0]
-        rle = (header >> 5) & 1
-        no_alpha = (header >> 6) & 1
+        cll = header & 0x07
+        cs = bool(header & 0x08)
+        rle = bool(header & 0x10)
+        no_alpha = bool(header & 0x20)
         offset = 1
 
-        if rle == 0:
-            if no_alpha == 0:
-                alpha_plane, offset = self._readRawPlane(data, offset, plane_size)
-            else:
-                alpha_plane = None
-            red_plane, offset = self._readRawPlane(data, offset, plane_size)
-            green_plane, offset = self._readRawPlane(data, offset, plane_size)
-            blue_plane, offset = self._readRawPlane(data, offset, plane_size)
+        if cs:
+            plane1_size = ((w + 1) // 2) * ((h + 1) // 2)
+            plane2_size = plane1_size
         else:
-            if no_alpha == 0:
-                alpha_plane, offset = self._decodeNRLE(data, offset, plane_size)
+            plane1_size = plane_size
+            plane2_size = plane_size
+
+        if not rle:
+            if not no_alpha:
+                plane0, offset = self._readRawPlane(data, offset, plane_size)
             else:
-                alpha_plane = None
-            red_plane, offset = self._decodeNRLE(data, offset, plane_size)
-            green_plane, offset = self._decodeNRLE(data, offset, plane_size)
-            blue_plane, offset = self._decodeNRLE(data, offset, plane_size)
+                plane0 = None
+            plane1, offset = self._readRawPlane(data, offset, plane1_size)
+            plane2, offset = self._readRawPlane(data, offset, plane2_size)
+            plane3, offset = self._readRawPlane(data, offset, plane_size)
+        else:
+            if not no_alpha:
+                plane0, offset = self._decodePlaneRLE(data, offset, plane_size)
+            else:
+                plane0 = None
+            plane1, offset = self._decodePlaneRLE(data, offset, plane1_size)
+            plane2, offset = self._decodePlaneRLE(data, offset, plane2_size)
+            plane3, offset = self._decodePlaneRLE(data, offset, plane_size)
 
-        self._applyDelta(alpha_plane, w, h)
-        self._applyDelta(red_plane, w, h)
-        self._applyDelta(green_plane, w, h)
-        self._applyDelta(blue_plane, w, h)
+        if cll == 0:
+            out_arr = np.frombuffer(out, dtype=np.uint8).reshape(plane_size, 4)
+            out_arr[:, 0] = np.frombuffer(plane3, dtype=np.uint8)[:plane_size]
+            out_arr[:, 1] = np.frombuffer(plane2, dtype=np.uint8)[:plane_size]
+            out_arr[:, 2] = np.frombuffer(plane1, dtype=np.uint8)[:plane_size]
+            if not no_alpha and plane0 is not None:
+                out_arr[:, 3] = np.frombuffer(plane0, dtype=np.uint8)[:plane_size]
+            else:
+                out_arr[:, 3] = 0xFF
+        else:
+            shift = cll
+            p3_np = np.frombuffer(plane3, dtype=np.uint8)
+            p1_np = np.frombuffer(plane1, dtype=np.int8)
+            p2_np = np.frombuffer(plane2, dtype=np.int8)
 
-        # Assemble BGRA interleaved using numpy (avoids Python per-pixel loop)
-        out_arr = np.frombuffer(out, dtype=np.uint8).reshape(plane_size, 4)
-        out_arr[:, 0] = np.frombuffer(blue_plane, dtype=np.uint8)[:plane_size] if blue_plane is not None else 0
-        out_arr[:, 1] = np.frombuffer(green_plane, dtype=np.uint8)[:plane_size] if green_plane is not None else 0
-        out_arr[:, 2] = np.frombuffer(red_plane, dtype=np.uint8)[:plane_size] if red_plane is not None else 0
-        out_arr[:, 3] = np.frombuffer(alpha_plane, dtype=np.uint8)[:plane_size] if alpha_plane is not None else 0xFF
+            if cs:
+                half_w = (w + 1) // 2
+                py = np.arange(h, dtype=np.int32) // 2
+                px = np.arange(w, dtype=np.int32) // 2
+                ci = (py[:, np.newaxis] * half_w + px[np.newaxis, :]).ravel()
+                np.clip(ci, 0, len(p1_np) - 1, out=ci)
+                co_raw = p1_np[ci].astype(np.int32)
+                cg_raw = p2_np[ci].astype(np.int32)
+                y_val = p3_np[:plane_size].astype(np.int32)
+            else:
+                y_val = p3_np[:plane_size].astype(np.int32)
+                co_raw = p1_np[:plane_size].astype(np.int32)
+                cg_raw = p2_np[:plane_size].astype(np.int32)
+
+            co = co_raw << shift
+            cg = cg_raw << shift
+            t = y_val - (cg >> 1)
+            g = np.clip(t + cg, 0, 255).astype(np.uint8)
+            b = t - (co >> 1)
+            r = np.clip(b + co, 0, 255).astype(np.uint8)
+            b = np.clip(b, 0, 255).astype(np.uint8)
+
+            out_arr = np.frombuffer(out, dtype=np.uint8).reshape(plane_size, 4)
+            out_arr[:, 0] = b
+            out_arr[:, 1] = g
+            out_arr[:, 2] = r
+            if not no_alpha and plane0 is not None:
+                out_arr[:, 3] = np.frombuffer(plane0, dtype=np.uint8)[:plane_size]
+            else:
+                out_arr[:, 3] = 0xFF
+
         return out
 
     def _readRawPlane(self, data, offset, size):
@@ -1303,247 +1392,361 @@ class DrdynvcLayer(LayerAutomata):
             plane[:end - offset] = data[offset:end]
         return plane, offset + size
 
-    def _decodeNRLE(self, data, offset, plane_size):
-        """Decode an NRLE-encoded color plane (grdp decodeNRLE)."""
+    def _decodePlaneRLE(self, data, offset, plane_size):
+        """Decode an RDP 6.0 RLE plane per MS-RDPEGDI 2.2.2.5.1.2."""
         out = bytearray(plane_size)
         pos = 0
-        while pos < plane_size and offset < len(data):
+        dlen = len(data)
+        while pos < plane_size and offset < dlen:
             ctrl = data[offset]
             offset += 1
-            run_len = (ctrl >> 4) & 0x0F
-            raw_len = ctrl & 0x0F
-
-            if run_len == 15:
-                if offset >= len(data):
-                    break
-                ext = data[offset]
-                offset += 1
-                run_len += ext
-                if ext == 0xFF:
-                    if offset + 1 >= len(data):
+            n_run_length = ctrl & 0x0F
+            c_raw_bytes = ctrl >> 4
+            if n_run_length == 15:
+                while offset < dlen:
+                    b = data[offset]
+                    offset += 1
+                    n_run_length += b
+                    if b != 0xFF:
                         break
-                    run_len += struct.unpack_from('<H', data, offset)[0]
-                    offset += 2
-            fill = min(run_len, plane_size - pos)
-            pos += fill  # out is already zero-initialized
+            if n_run_length > 0:
+                run_fill = min(n_run_length, plane_size - pos)
+                if pos > 0:
+                    prev_val = out[pos - 1]
+                    out[pos:pos + run_fill] = bytes([prev_val]) * run_fill
+                pos += run_fill
 
-            if raw_len == 15:
-                if offset >= len(data):
-                    break
-                ext = data[offset]
-                offset += 1
-                raw_len += ext
-                if ext == 0xFF:
-                    if offset + 1 >= len(data):
+            if c_raw_bytes == 15:
+                while offset < dlen:
+                    b = data[offset]
+                    offset += 1
+                    c_raw_bytes += b
+                    if b != 0xFF:
                         break
-                    raw_len += struct.unpack_from('<H', data, offset)[0]
-                    offset += 2
-            actual = min(raw_len, plane_size - pos, len(data) - offset)
+            actual = min(c_raw_bytes, plane_size - pos, dlen - offset)
             if actual > 0:
                 out[pos:pos + actual] = data[offset:offset + actual]
                 pos += actual
                 offset += actual
         return out, offset
 
-    def _applyDelta(self, plane, w, h):
-        """XOR each row with the previous row (delta decode) — vectorized."""
-        if plane is None or len(plane) < w * h:
-            return
-        arr = np.frombuffer(plane, dtype=np.uint8).reshape(h, w)
-        np.bitwise_xor.accumulate(arr, axis=0, out=arr)
-
+    # ---------------------------------------------------------------
+    # ClearCodec (0x0008) — ported from grdp decodeClearCodec
+    # ---------------------------------------------------------------
 
     def _renderClearCodec(self, surfaceId, left, top, width, height, pixelFormat, bitmapData):
         """Decode ClearCodec bitmap per MS-RDPEGFX 2.2.4."""
-        data = bitmapData
-        if len(data) < 12:
+        out = self._decodeClearCodec(bitmapData, width, height)
+        if out is None:
             return
-        off = 0
-
-        residual_len = struct.unpack_from('<I', data, off)[0]
-        band_len = struct.unpack_from('<I', data, off + 4)[0]
-        subcodec_len = struct.unpack_from('<I', data, off + 8)[0]
-
-        off += 12
-        out = bytearray(width * height * 4)
-
-        # 1. Residual layer: 3 bytes per pixel (BGR), top-down
-        if residual_len > 0:
-            res_data = data[off:off + residual_len]
-            off += residual_len
-            n_pixels = width * height
-            usable = min(len(res_data) // 3, n_pixels)
-            if usable > 0:
-                bgr = np.frombuffer(res_data[:usable * 3], dtype=np.uint8).reshape(usable, 3)
-                out_arr = np.frombuffer(out, dtype=np.uint8).reshape(-1, 4)
-                out_arr[:usable, :3] = bgr
-                out_arr[:usable, 3] = 0xFF
-
-        # 2. Band layer
-        if band_len > 0:
-            band_data = data[off:off + band_len]
-            off += band_len
-            self._decodeClearCodecBands(band_data, out, width)
-
-        # 3. Subcodec layer
-        if subcodec_len > 0:
-            sub_data = data[off:off + subcodec_len]
-            off += subcodec_len
-            self._decodeClearCodecSubcodec(sub_data, out, width)
-
         self._blitToSurface(surfaceId, left, top, width, height, out)
         ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
         self._deliverBitmap(ox + left, oy + top, width, height, 32, bytes(out))
 
-    def _decodeClearCodecBands(self, data, out, surfW):
-        """Decode ClearCodec band layer matching grdp's decodeBands.
-        Band header: xStart(2) yStart(2) xEnd(2) yEnd(2) blueBkg(1) greenBkg(1) redBkg(1).
-        VBARs classified by top 2 bits of header."""
-        off = 0
-        remaining = len(data)
+    def _decodeClearCodec(self, data, width, height):
+        if len(data) < 2:
+            return bytearray(width * height * 4)
 
-        while remaining >= 11:
+        flags = struct.unpack_from('<H', data, 0)[0]
+        off = 2
+
+        if flags & 0x04:  # CLEARCODEC_FLAG_CACHE_RESET
+            self._resetClearCodecVBar()
+
+        out = bytearray(width * height * 4)
+        glyph_index = 0
+        has_glyph_index = False
+
+        if flags & (0x01 | 0x02):  # CLEARCODEC_FLAG_GLYPH_INDEX | CLEARCODEC_FLAG_GLYPH_HIT
+            if off + 2 <= len(data):
+                glyph_index = struct.unpack_from('<H', data, off)[0]
+                has_glyph_index = True
+                off += 2
+
+        if flags & 0x02:  # CLEARCODEC_FLAG_GLYPH_HIT
+            if has_glyph_index:
+                cached = self._ccGlyphStorage.get(glyph_index)
+                if cached is not None and len(cached) == width * height * 4:
+                    out[:] = cached
+            return out
+
+        if off + 12 > len(data):
+            return out
+
+        residual_len = struct.unpack_from('<I', data, off)[0]
+        bands_len = struct.unpack_from('<I', data, off + 4)[0]
+        subcodec_len = struct.unpack_from('<I', data, off + 8)[0]
+        off += 12
+
+        if residual_len > 0 and off + residual_len <= len(data):
+            self._decodeClearCodecResidual(data[off:off + residual_len], out, width, height)
+            off += residual_len
+        if bands_len > 0 and off + bands_len <= len(data):
+            self._decodeClearCodecBands(data[off:off + bands_len], out, width, height)
+            off += bands_len
+        if subcodec_len > 0 and off + subcodec_len <= len(data):
+            self._decodeClearCodecSubcodec(data[off:off + subcodec_len], out, width, height)
+            off += subcodec_len
+
+        if (flags & 0x01) and has_glyph_index:  # CLEARCODEC_FLAG_GLYPH_INDEX
+            self._ccGlyphStorage[glyph_index] = bytes(out)
+
+        return out
+
+    def _decodeClearCodecResidual(self, data, out, width, height):
+        total_pixels = width * height
+        pixel_index = 0
+        off = 0
+        dlen = len(data)
+        out_view = memoryview(out)
+        while off + 4 <= dlen and pixel_index < total_pixels:
+            b = data[off]
+            g = data[off + 1]
+            r = data[off + 2]
+            run_len = data[off + 3]
+            off += 4
+            if run_len >= 0xFF:
+                if off + 2 > dlen:
+                    break
+                run_len = struct.unpack_from('<H', data, off)[0]
+                off += 2
+                if run_len >= 0xFFFF:
+                    if off + 4 > dlen:
+                        break
+                    run_len = struct.unpack_from('<I', data, off)[0]
+                    off += 4
+            end = min(pixel_index + run_len, total_pixels)
+            fill_len = end - pixel_index
+            if fill_len > 0:
+                out_view[pixel_index * 4:end * 4] = bytes([b, g, r, 0xFF]) * fill_len
+            pixel_index = end
+
+    def _decodeClearCodecBands(self, data, out, surfW, surfH):
+        off = 0
+        dlen = len(data)
+        out_u32 = np.frombuffer(out, dtype=np.uint32)
+
+        while off + 11 <= dlen:
             x_start = struct.unpack_from('<H', data, off)[0]
-            y_start = struct.unpack_from('<H', data, off + 2)[0]
-            x_end = struct.unpack_from('<H', data, off + 4)[0]
+            x_end = struct.unpack_from('<H', data, off + 2)[0]
+            y_start = struct.unpack_from('<H', data, off + 4)[0]
             y_end = struct.unpack_from('<H', data, off + 6)[0]
             blue_bg = data[off + 8]
             green_bg = data[off + 9]
             red_bg = data[off + 10]
             off += 11
-            remaining -= 11
 
-            band_h = y_end - y_start
-            col_count = x_end - x_start
-            if band_h <= 0 or col_count <= 0:
+            if x_end < x_start or y_end < y_start:
                 continue
 
-            for col in range(col_count):
-                if remaining < 2:
+            band_h = y_end - y_start + 1
+            vbar_count = x_end - x_start + 1
+            color_bkg = blue_bg | (green_bg << 8) | (red_bg << 16) | (0xFF << 24)
+
+            for i in range(vbar_count):
+                if off + 2 > dlen:
                     return
                 vbar_header = struct.unpack_from('<H', data, off)[0]
                 off += 2
-                remaining -= 2
-                x = x_start + col
+
+                cur_vbar = None
+                vbar_short_entry = None
+                vbar_update = False
+                vbar_y_on = 0
+                vbar_short_pixel_count = 0
 
                 top2 = vbar_header & 0xC000
-
-                if top2 == 0xC000:
-                    # SHORT_VBAR_CACHE_HIT — yOn=0 per grdp reference
-                    idx = vbar_header & 0x3FFF
-                    entry = self._ccShortVBarStorage[idx] if idx < len(self._ccShortVBarStorage) else None
-                    if entry is not None:
-                        pixels, count = entry
-                        self._paintColumnBg(out, surfW, x, y_start, band_h, red_bg, green_bg, blue_bg)
-                        self._paintVBarPixels(out, surfW, x, y_start, 0, pixels, count)
-
-                elif top2 == 0x4000:
-                    # SHORT_VBAR_CACHE_MISS
-                    pix_count = vbar_header & 0x3FFF
-                    if remaining < 1:
+                if top2 == 0x4000:  # SHORT_VBAR_CACHE_HIT
+                    vbar_index = vbar_header & 0x3FFF
+                    if vbar_index < len(self._ccShortVBarStorage):
+                        vbar_short_entry = self._ccShortVBarStorage[vbar_index]
+                    if off >= dlen:
                         return
-                    y_on = data[off]  # 1 byte
+                    vbar_y_on = data[off]
                     off += 1
-                    remaining -= 1
-                    need = pix_count * 3
-                    pixels = bytes(data[off:off + min(need, remaining)])
-                    off += min(need, remaining)
-                    remaining -= min(need, remaining)
-                    entry = (pixels, pix_count)
+                    if vbar_short_entry is not None:
+                        vbar_short_pixel_count = len(vbar_short_entry)
+                    vbar_update = True
+                elif top2 == 0x0000:  # SHORT_VBAR_CACHE_MISS
+                    vbar_y_on = vbar_header & 0xFF
+                    vbar_y_off = (vbar_header >> 8) & 0x3F
+                    if vbar_y_off >= vbar_y_on:
+                        vbar_short_pixel_count = vbar_y_off - vbar_y_on
+                    if off + vbar_short_pixel_count * 3 > dlen:
+                        return
+                    short_pixels = np.empty(vbar_short_pixel_count, dtype=np.uint32)
+                    for p in range(vbar_short_pixel_count):
+                        b = data[off]
+                        g = data[off + 1]
+                        r = data[off + 2]
+                        off += 3
+                        short_pixels[p] = b | (g << 8) | (r << 16) | (0xFF << 24)
+                    vbar_short_entry = short_pixels
                     if self._ccShortVBarCursor < len(self._ccShortVBarStorage):
-                        self._ccShortVBarStorage[self._ccShortVBarCursor] = entry
+                        self._ccShortVBarStorage[self._ccShortVBarCursor] = vbar_short_entry
                     self._ccShortVBarCursor = (self._ccShortVBarCursor + 1) % len(self._ccShortVBarStorage)
-                    self._paintColumnBg(out, surfW, x, y_start, band_h, red_bg, green_bg, blue_bg)
-                    self._paintVBarPixels(out, surfW, x, y_start, y_on, pixels, pix_count)
-
-                elif (vbar_header & 0x8000) == 0x8000:
-                    # VBAR_CACHE_HIT
-                    idx = vbar_header & 0x7FFF
-                    entry = self._ccVBarStorage[idx] if idx < len(self._ccVBarStorage) else None
-                    if entry is not None:
-                        pixels, count = entry
-                        self._paintVBarPixels(out, surfW, x, y_start, 0, pixels, count)
-
+                    vbar_update = True
+                elif (vbar_header & 0x8000) == 0x8000:  # VBAR_CACHE_HIT
+                    vbar_index = vbar_header & 0x7FFF
+                    if vbar_index < len(self._ccVBarStorage):
+                        cur_vbar = self._ccVBarStorage[vbar_index]
+                    if cur_vbar is None or len(cur_vbar) == 0:
+                        cur_vbar = np.full(band_h, color_bkg, dtype=np.uint32)
                 else:
-                    # VBAR_CACHE_MISS
-                    pix_count = vbar_header & 0x7FFF
-                    need = pix_count * 3
-                    pixels = bytes(data[off:off + min(need, remaining)])
-                    off += min(need, remaining)
-                    remaining -= min(need, remaining)
-                    entry = (pixels, pix_count)
+                    return
+
+                if vbar_update:
+                    vbar_pixels = np.full(band_h, color_bkg, dtype=np.uint32)
+                    if vbar_short_entry is not None and vbar_short_pixel_count > 0:
+                        copy_count = min(vbar_short_pixel_count, max(0, band_h - vbar_y_on))
+                        if copy_count > 0 and vbar_y_on < band_h:
+                            vbar_pixels[vbar_y_on:vbar_y_on + copy_count] = vbar_short_entry[:copy_count]
+                    cur_vbar = vbar_pixels
                     if self._ccVBarCursor < len(self._ccVBarStorage):
-                        self._ccVBarStorage[self._ccVBarCursor] = entry
+                        self._ccVBarStorage[self._ccVBarCursor] = cur_vbar
                     self._ccVBarCursor = (self._ccVBarCursor + 1) % len(self._ccVBarStorage)
-                    self._paintVBarPixels(out, surfW, x, y_start, 0, pixels, pix_count)
 
-    def _paintColumnBg(self, out, surfW, x, yStart, height, r, g, b):
-        """Fill a single column with background color (BGRA)."""
-        for y in range(height):
-            dy = yStart + y
-            idx = (dy * surfW + x) * 4
-            if idx + 3 < len(out):
-                out[idx] = b
-                out[idx + 1] = g
-                out[idx + 2] = r
-                out[idx + 3] = 0xFF
+                # Render column x = x_start + i
+                dst_x = x_start + i
+                if 0 <= dst_x < surfW and cur_vbar is not None:
+                    max_y = min(len(cur_vbar), surfH - y_start)
+                    for y in range(max(0, -y_start), max_y):
+                        dst_y = y_start + y
+                        dst_idx = dst_y * surfW + dst_x
+                        if dst_idx < len(out_u32):
+                            out_u32[dst_idx] = cur_vbar[y]
 
-    def _paintVBarPixels(self, out, surfW, x, yStart, yOn, pixels, count):
-        """Paint VBAR pixel data (BGR, 3 bytes per pixel) onto output buffer."""
-        for y in range(count):
-            si = y * 3
-            dy = yStart + yOn + y
-            di = (dy * surfW + x) * 4
-            if si + 2 < len(pixels) and di + 3 < len(out):
-                out[di] = pixels[si]         # B
-                out[di + 1] = pixels[si + 1] # G
-                out[di + 2] = pixels[si + 2] # R
-                out[di + 3] = 0xFF
-
-    def _decodeClearCodecSubcodec(self, data, out, surfW):
-        """Decode ClearCodec subcodec layer matching grdp's decodeSubcodec."""
+    def _decodeClearCodecSubcodec(self, data, out, surfW, surfH):
         off = 0
-        remaining = len(data)
-        while remaining >= 13:
+        dlen = len(data)
+        out_u32 = np.frombuffer(out, dtype=np.uint32)
+
+        while off + 13 <= dlen:
             x_start = struct.unpack_from('<H', data, off)[0]
             y_start = struct.unpack_from('<H', data, off + 2)[0]
-            w = struct.unpack_from('<H', data, off + 4)[0]
-            h = struct.unpack_from('<H', data, off + 6)[0]
+            width = struct.unpack_from('<H', data, off + 4)[0]
+            height = struct.unpack_from('<H', data, off + 6)[0]
             bmp_len = struct.unpack_from('<I', data, off + 8)[0]
             subcodec_id = data[off + 12]
             off += 13
-            remaining -= 13
-            if bmp_len > remaining:
+
+            if off + bmp_len > dlen:
                 break
             bmp_data = data[off:off + bmp_len]
             off += bmp_len
-            remaining -= bmp_len
-            if subcodec_id == 0:
-                # RAW BGR
-                usable_sc = min(len(bmp_data) // 3, w * h)
-                if usable_sc > 0:
-                    bgr = np.frombuffer(bmp_data[:usable_sc * 3], dtype=np.uint8).reshape(usable_sc, 3)
-                    bgra = np.empty((usable_sc, 4), dtype=np.uint8)
-                    bgra[:, :3] = bgr
-                    bgra[:, 3] = 0xFF
-                    if usable_sc == w * h:
-                        out_arr = np.frombuffer(out, dtype=np.uint8).reshape(-1, surfW * 4)
-                        bgra_rows = bgra.reshape(h, w * 4)
-                        y_end = min(y_start + h, out_arr.shape[0])
-                        x_end = min((x_start + w) * 4, out_arr.shape[1])
-                        out_arr[y_start:y_end, x_start * 4:x_end] = bgra_rows[:y_end - y_start, :x_end - x_start * 4]
-            elif subcodec_id == 2:
-                # NSCodec (single color fill): 3 bytes BGR
-                if len(bmp_data) >= 3:
-                    fill_row = np.empty(w * 4, dtype=np.uint8)
-                    fill_row[0::4] = bmp_data[0]
-                    fill_row[1::4] = bmp_data[1]
-                    fill_row[2::4] = bmp_data[2]
-                    fill_row[3::4] = 0xFF
-                    out_arr = np.frombuffer(out, dtype=np.uint8).reshape(-1, surfW * 4)
-                    y_end = min(y_start + h, out_arr.shape[0])
-                    x_end = min((x_start + w) * 4, out_arr.shape[1])
-                    out_arr[y_start:y_end, x_start * 4:x_end] = fill_row[:x_end - x_start * 4]
+
+            if subcodec_id == 0:  # Uncompressed BGR24
+                src_off = 0
+                for y in range(height):
+                    dst_y = y_start + y
+                    for x in range(width):
+                        if src_off + 3 > len(bmp_data):
+                            break
+                        b = bmp_data[src_off]
+                        g = bmp_data[src_off + 1]
+                        r = bmp_data[src_off + 2]
+                        src_off += 3
+                        dst_x = x_start + x
+                        if 0 <= dst_x < surfW and 0 <= dst_y < surfH:
+                            dst_idx = dst_y * surfW + dst_x
+                            if dst_idx < len(out_u32):
+                                out_u32[dst_idx] = b | (g << 8) | (r << 16) | (0xFF << 24)
+
+            elif subcodec_id == 1:  # CLEARCODEC_SUBCODEC_NSCODEC
+                nsc_bgra = decode_nscodec(bmp_data, width, height)
+                if nsc_bgra is not None:
+                    nsc_u32 = np.frombuffer(nsc_bgra, dtype=np.uint32).reshape(height, width)
+                    dst_y_end = min(y_start + height, surfH)
+                    dst_x_end = min(x_start + width, surfW)
+                    if dst_y_end > y_start and dst_x_end > x_start:
+                        out_2d = out_u32.reshape(surfH, surfW)
+                        h_copy = dst_y_end - y_start
+                        w_copy = dst_x_end - x_start
+                        out_2d[y_start:dst_y_end, x_start:dst_x_end] = nsc_u32[:h_copy, :w_copy]
+
+            elif subcodec_id == 2:  # CLEARCODEC_SUBCODEC_RLEX
+                if len(bmp_data) < 1:
+                    continue
+                palette_count = bmp_data[0]
+                if palette_count < 1 or palette_count > 127 or 1 + palette_count * 3 > len(bmp_data):
+                    continue
+                palette = np.empty(palette_count, dtype=np.uint32)
+                p_off = 1
+                for p in range(palette_count):
+                    b = bmp_data[p_off]
+                    g = bmp_data[p_off + 1]
+                    r = bmp_data[p_off + 2]
+                    p_off += 3
+                    palette[p] = b | (g << 8) | (r << 16) | (0xFF << 24)
+
+                num_bits = _CLEAR_LOG2_FLOOR[palette_count - 1] + 1
+                depth_mask = (1 << (8 - num_bits)) - 1
+                stop_mask = (1 << num_bits) - 1
+
+                pixel_count = width * height
+                pixel_index = 0
+                x = 0
+                y = 0
+                bmp_dlen = len(bmp_data)
+
+                while p_off < bmp_dlen and pixel_index < pixel_count:
+                    if p_off + 2 > bmp_dlen:
+                        break
+                    tmp = bmp_data[p_off]
+                    run_length_factor = bmp_data[p_off + 1]
+                    p_off += 2
+
+                    suite_depth = (tmp >> num_bits) & depth_mask
+                    stop_index = tmp & stop_mask
+                    start_index = stop_index - suite_depth
+
+                    if run_length_factor >= 0xFF:
+                        if p_off + 2 > bmp_dlen:
+                            break
+                        run_length_factor = struct.unpack_from('<H', bmp_data, p_off)[0]
+                        p_off += 2
+                        if run_length_factor >= 0xFFFF:
+                            if p_off + 4 > bmp_dlen:
+                                break
+                            run_length_factor = struct.unpack_from('<I', bmp_data, p_off)[0]
+                            p_off += 4
+
+                    if start_index < 0 or start_index >= palette_count or stop_index >= palette_count:
+                        break
+
+                    color = palette[start_index]
+                    for r_run in range(run_length_factor):
+                        if pixel_index >= pixel_count:
+                            break
+                        dst_x = x_start + x
+                        dst_y = y_start + y
+                        if 0 <= dst_x < surfW and 0 <= dst_y < surfH:
+                            dst_idx = dst_y * surfW + dst_x
+                            if dst_idx < len(out_u32):
+                                out_u32[dst_idx] = color
+                        x += 1
+                        if x >= width:
+                            x = 0
+                            y += 1
+                        pixel_index += 1
+
+                    for s in range(suite_depth + 1):
+                        if pixel_index >= pixel_count:
+                            break
+                        idx = start_index + s
+                        if idx < palette_count:
+                            ccolor = palette[idx]
+                            dst_x = x_start + x
+                            dst_y = y_start + y
+                            if 0 <= dst_x < surfW and 0 <= dst_y < surfH:
+                                dst_idx = dst_y * surfW + dst_x
+                                if dst_idx < len(out_u32):
+                                    out_u32[dst_idx] = ccolor
+                        x += 1
+                        if x >= width:
+                            x = 0
+                            y += 1
+                        pixel_index += 1
 
     def _blitToSurface(self, surfaceId, left, top, width, height, data):
         """Write pixel data (top-down BGRA) into the surface buffer."""
@@ -1683,13 +1886,13 @@ class DrdynvcLayer(LayerAutomata):
             return
         surfaceId = struct.unpack_from('<H', payload, 0)[0]
         codecContextId = struct.unpack_from('<I', payload, 2)[0]
-        # Reset RFX Progressive tile state so stale data is not reused
-        self._rfxDecoder.reset()
+        # Note: Tile coefficient state belongs to the surface and must NOT
+        # be discarded per encoding context deletion (FreeRDP / grdp).
         log.debug("RDPGFX: DELETEENCODINGCTX surf=%d ctx=%d" % (surfaceId, codecContextId))
 
     def _deliverSurfaceBitmap(self, surfaceId, rects):
         """Deliver decoded Progressive tiles for a surface to the observer."""
-        if self._gfxCallback is None or not rects:
+        if (self._gfxCallback is None and self._gfxSurfaceCallback is None) or not rects:
             return
         surfInfo = self._surfaces.get(surfaceId)
         surfBuf = self._surfaceData.get(surfaceId)
@@ -1698,7 +1901,7 @@ class DrdynvcLayer(LayerAutomata):
         surfW, surfH, _ = surfInfo
         ox, oy = self._surfaceOutputMap.get(surfaceId, (0, 0))
 
-        # Numpy view of surface for fast region extraction
+        # Numpy view of surface for fast region extraction fallback
         try:
             surf_arr = surfBuf.reshape(surfH, surfW * 4)
         except ValueError:
@@ -1707,14 +1910,18 @@ class DrdynvcLayer(LayerAutomata):
         for (rx, ry, rw, rh) in rects:
             if rw <= 0 or rh <= 0:
                 continue
-            if surf_arr is not None:
+            if self._gfxSurfaceCallback is not None:
+                self._gfxSurfaceCallback(ox + rx, oy + ry, rw, rh,
+                                         surfBuf, surfW, rx, ry)
+            elif surf_arr is not None:
                 try:
                     region = surf_arr[ry:ry + rh, rx * 4:(rx + rw) * 4].tobytes()
                 except (ValueError, IndexError):
                     region = self._extractRegionFallback(surfBuf, surfW, rx, ry, rw, rh)
+                self._deliverBitmap(ox + rx, oy + ry, rw, rh, 32, region)
             else:
                 region = self._extractRegionFallback(surfBuf, surfW, rx, ry, rw, rh)
-            self._deliverBitmap(ox + rx, oy + ry, rw, rh, 32, region)
+                self._deliverBitmap(ox + rx, oy + ry, rw, rh, 32, region)
 
     def _extractRegionFallback(self, surfBuf, surfW, rx, ry, rw, rh):
         """Row-by-row region extraction fallback."""
@@ -1782,36 +1989,37 @@ class DrdynvcLayer(LayerAutomata):
                                         RDPGFX_CAPS_FLAG_SMALL_CACHE |
                                         RDPGFX_CAPS_FLAG_AVC420_ENABLED))
 
-            # ---- v10+ : AVC enabled by default (no AVC_DISABLED flag) ----
-            caps10Flags = RDPGFX_CAPS_FLAG_SMALL_CACHE
+            if not self._avc444Disabled:
+                # ---- v10+ : AVC enabled by default (no AVC_DISABLED flag) ----
+                caps10Flags = RDPGFX_CAPS_FLAG_SMALL_CACHE
 
-            capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_10, 4,
-                                        caps10Flags))
+                capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_10, 4,
+                                            caps10Flags))
 
-            # v10.1 has capsDataLength=0x10 (FreeRDP sends 16 bytes with flags=0)
-            capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_101, 0x10, 0)
-                            + b'\x00' * 12)
+                # v10.1 has capsDataLength=0x10 (FreeRDP sends 16 bytes with flags=0)
+                capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_101, 0x10, 0)
+                                + b'\x00' * 12)
 
-            capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_102, 4,
-                                        caps10Flags))
+                capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_102, 4,
+                                            caps10Flags))
 
-            capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_103, 4,
-                                        caps10Flags & ~RDPGFX_CAPS_FLAG_SMALL_CACHE))
+                capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_103, 4,
+                                            caps10Flags & ~RDPGFX_CAPS_FLAG_SMALL_CACHE))
 
-            capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_104, 4,
-                                        caps10Flags))
+                capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_104, 4,
+                                            caps10Flags))
 
-            capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_105, 4,
-                                        caps10Flags))
+                capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_105, 4,
+                                            caps10Flags))
 
-            capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_106, 4,
-                                        caps10Flags))
+                capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_106, 4,
+                                            caps10Flags))
 
-            capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_106_ERR, 4,
-                                        caps10Flags))
+                capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_106_ERR, 4,
+                                            caps10Flags))
 
-            capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_107, 4,
-                                        caps10Flags))
+                capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_107, 4,
+                                            caps10Flags))
         else:
             # Non-AVC: v8.0 only + THINCLIENT, matching grdp's thin-client path.
             capsSets.append(struct.pack('<III', RDPGFX_CAPVERSION_8, 4,
@@ -1829,7 +2037,10 @@ class DrdynvcLayer(LayerAutomata):
 
         self._sendDvcData(channelId, cbId, gfxPdu)
         if avc_module.is_available():
-            log.debug("RDPGFX: sent CAPS_ADVERTISE (v10.7..v8.0, AVC enabled)")
+            if self._avc444Disabled:
+                log.debug("RDPGFX: sent CAPS_ADVERTISE (v8.1..v8.0, AVC444 disabled)")
+            else:
+                log.debug("RDPGFX: sent CAPS_ADVERTISE (v10.7..v8.0, AVC enabled)")
         else:
             log.debug("RDPGFX: sent CAPS_ADVERTISE (v8.0 only, THINCLIENT, AVC disabled)")
 

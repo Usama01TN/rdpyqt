@@ -242,6 +242,19 @@ class RDPClientController(pdu.layer.PDUClientListener):
         layer should trigger a full RDP reconnect in response.
         """
         self._drdynvcLayer.setDecoderBrokenCallback(callback)
+
+    def setAVC444Disabled(self, disabled):
+        """
+        @summary: Disable AVC444 / AVC444v2 support in RDPGFX
+        @param disabled: {bool}
+        """
+        self._drdynvcLayer.setAVC444Disabled(disabled)
+
+    def disableAVC444(self):
+        """
+        @summary: Disable AVC444 / AVC444v2 support in RDPGFX
+        """
+        self._drdynvcLayer.setAVC444Disabled(True)
         
     def addClientObserver(self, observer):
         """

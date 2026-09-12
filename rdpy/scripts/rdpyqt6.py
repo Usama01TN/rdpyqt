@@ -104,7 +104,7 @@ class RDPClientQtFactory(rdp.ClientFactory):
     """
     @summary: Factory create a RDP GUI client
     """
-    def __init__(self, app, width, height, username, password, domain, keyboardType, keyboardLayout, security, swap_alt_meta=False):
+    def __init__(self, app, width, height, username, password, domain, keyboardType, keyboardLayout, security, swap_alt_meta=False, disable_avc444=False):
         """
         @param app: {QApplication} Qt application instance
         @param width: {integer} width of client
@@ -116,6 +116,7 @@ class RDPClientQtFactory(rdp.ClientFactory):
         @param keyboardLayout: {str} name of gcc.KeyboardLayout attribute (e.g. US, FRENCH)
         @param security: {str} (ssl | rdp | nego)
         @param swap_alt_meta: {bool} swap Alt and Meta (Windows) keys
+        @param disable_avc444: {bool} disable AVC444/AVC444v2 and use AVC420 only
         """
         self._app = app
         self._width = width
@@ -134,6 +135,7 @@ class RDPClientQtFactory(rdp.ClientFactory):
         else:
             self._security = security
         self._swap_alt_meta = swap_alt_meta
+        self._disable_avc444 = disable_avc444
         self._w = None
         self._resizing = False
         self._decoderBroken = False
@@ -166,6 +168,7 @@ class RDPClientQtFactory(rdp.ClientFactory):
         controller.setKeyboardLayout(self._keyboardLayout)
         controller.setHostname(socket.gethostname())
         controller.setSecurityLevel(self._security)
+        controller.setAVC444Disabled(self._disable_avc444)
 
         # Wire up H.264 decoder-broken callback for auto-reconnect
         controller.setDecoderBrokenCallback(self._onDecoderBroken)
@@ -259,6 +262,7 @@ def help():
     \t-kt: keyboard type (e.g. IBM_101_102_KEYS) [default : IBM_101_102_KEYS]
     \t-kl: keyboard layout (e.g. US, FRENCH) [default : US]
     \t--swap-alt-meta: swap Alt and Meta (Windows/Super/Command) keys [default : False]
+    \t--disable-avc444: disable AVC444/AVC444v2 and use AVC420 only [default : False]
     """)
 
 
@@ -271,6 +275,7 @@ def main():
     keyboardType = "IBM_101_102_KEYS"
     keyboardLayout = "US"
     swap_alt_meta = False
+    disable_avc444 = False
     
     argv = []
     for a in sys.argv[1:]:
@@ -278,11 +283,15 @@ def main():
             argv.append("--kt" + a[3:])
         elif a.startswith("-kl"):
             argv.append("--kl" + a[3:])
+        elif a == "-disable-avc444":
+            argv.append("--disable-avc444")
+        elif a == "-swap-alt-meta":
+            argv.append("--swap-alt-meta")
         else:
             argv.append(a)
 
     try:
-        opts, args = getopt.getopt(argv, "fou:p:d:w:h:r:", ["kt=", "kl=", "swap-alt-meta"])
+        opts, args = getopt.getopt(argv, "fou:p:d:w:h:r:", ["kt=", "kl=", "swap-alt-meta", "disable-avc444"])
     except getopt.GetoptError:
         help()
         sys.exit(1)
@@ -303,6 +312,8 @@ def main():
             keyboardLayout = arg
         elif opt == "--swap-alt-meta":
             swap_alt_meta = True
+        elif opt == "--disable-avc444":
+            disable_avc444 = True
 
     if not username:
         username = input("User: ")
@@ -323,7 +334,7 @@ def main():
     log.info("keyboard type set to %s" % keyboardType)
     log.info("keyboard layout set to %s" % keyboardLayout)
 
-    factory = RDPClientQtFactory(app, width, height, username, password, domain, keyboardType, keyboardLayout, "nego", swap_alt_meta)
+    factory = RDPClientQtFactory(app, width, height, username, password, domain, keyboardType, keyboardLayout, "nego", swap_alt_meta, disable_avc444)
 
     # Pre-create the Qt invoker on the Qt main thread so the _QtInvoker QObject
     # lives on the Qt main thread.  If created lazily from the Twisted thread it

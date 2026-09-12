@@ -35,6 +35,7 @@ rdpyqt6 [options] ip[:port]
 | `-kt`   | Keyboard type (see values below)              | `IBM_101_102_KEYS`   |
 | `-kl`   | Keyboard layout (see values below)            | `US`                 |
 | `--swap-alt-meta` | Swap Alt and Meta (Windows/Super/Command) keys | (disabled)     |
+| `--disable-avc444` | Disable AVC444/AVC444v2 and use AVC420 only   | (disabled)     |
 
 #### `-kt` Keyboard Type values
 
