@@ -616,8 +616,10 @@ def _combine_avc444v2_bgra(y_plane, u_half, v_half, aux_frame, full_range, int w
     Caller must copy before next decode if retaining.
     """
     cdef int half_w = w // 2
+    cdef int even_w = (w + 1) // 2
     cdef int quarter_w = w // 4
     cdef int half_h = (h + 1) // 2
+    cdef int odd_h = h // 2
 
     aux_y = _plane_to_array(aux_frame.planes[0])
     aux_u = _plane_to_array(aux_frame.planes[1])
@@ -629,19 +631,19 @@ def _combine_avc444v2_bgra(y_plane, u_half, v_half, aux_frame, full_range, int w
 
     # B4/B5: odd columns, all rows — from aux_y
     U444[:h, 1::2] = aux_y[:h, :half_w]
-    V444[:h, 1::2] = aux_y[:h, half_w:half_w + (w - half_w)]
+    V444[:h, 1::2] = aux_y[:h, half_w:half_w + half_w]
 
     # B2/B3: even columns, even rows — from stream1 half-res chroma
-    U444[0::2, 0::2] = u_half[:half_h, :half_w]
-    V444[0::2, 0::2] = v_half[:half_h, :half_w]
+    U444[0::2, 0::2] = u_half[:half_h, :even_w]
+    V444[0::2, 0::2] = v_half[:half_h, :even_w]
 
     # B6/B7: col % 4 == 0, odd rows — from aux_u
-    U444[1::2, 0::4] = aux_u[:half_h, :quarter_w]
-    V444[1::2, 0::4] = aux_u[:half_h, quarter_w:quarter_w * 2]
+    U444[1::2, 0::4] = aux_u[:odd_h, :quarter_w]
+    V444[1::2, 0::4] = aux_u[:odd_h, quarter_w:quarter_w * 2]
 
     # B8/B9: col % 4 == 2, odd rows — from aux_v
-    U444[1::2, 2::4] = aux_v[:half_h, :quarter_w]
-    V444[1::2, 2::4] = aux_v[:half_h, quarter_w:quarter_w * 2]
+    U444[1::2, 2::4] = aux_v[:odd_h, :quarter_w]
+    V444[1::2, 2::4] = aux_v[:odd_h, quarter_w:quarter_w * 2]
 
     return _bt601_yuv444_to_bgra(y_plane, U444, V444, full_range)
 

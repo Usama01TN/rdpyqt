@@ -1564,11 +1564,12 @@ class DrdynvcLayer(LayerAutomata):
         except (ValueError, IndexError):
             # Fallback for mismatched sizes
             stride = width * 4
+            src_bytes = bytes(data) if not isinstance(data, (bytes, bytearray, memoryview)) else data
             for row in range(height):
                 src_off = row * stride
                 dst_off = ((top + row) * surfW + left) * 4
-                if src_off + stride <= len(data) and dst_off + stride <= len(surfBuf):
-                    surfBuf[dst_off:dst_off + stride] = data[src_off:src_off + stride]
+                if src_off + stride <= len(src_bytes) and dst_off + stride <= len(surfBuf):
+                    surfBuf[dst_off:dst_off + stride] = np.frombuffer(src_bytes[src_off:src_off + stride], dtype=np.uint8)
 
     def _onSurfaceToCache(self, payload):
         """SURFACETOCACHE: surfaceId(2) + cacheKey(8) + cacheSlot(2) + rectLeft(2) +
@@ -1602,7 +1603,8 @@ class DrdynvcLayer(LayerAutomata):
                 src_off = ((rectTop + row) * surfW + rectLeft) * 4
                 dst_off = row * w * 4
                 if src_off + w * 4 <= len(surfBuf):
-                    region[dst_off:dst_off + w * 4] = surfBuf[src_off:src_off + w * 4]
+                    row_data = surfBuf[src_off:src_off + w * 4]
+                    region[dst_off:dst_off + w * 4] = row_data.tobytes() if isinstance(row_data, np.ndarray) else row_data
 
         self._gfxCache[cacheSlot] = (w, h, region)
         log.debug("RDPGFX: SURFACETOCACHE surf=%d slot=%d rect=(%d,%d,%d,%d)" %
@@ -1654,13 +1656,13 @@ class DrdynvcLayer(LayerAutomata):
                         src_off = row * cw * 4
                         dst_off = ((dy + row) * surfW + dx) * 4
                         if dst_off + cw * 4 <= len(surfBuf) and src_off + cw * 4 <= len(cdata):
-                            surfBuf[dst_off:dst_off + cw * 4] = cdata[src_off:src_off + cw * 4]
+                            surfBuf[dst_off:dst_off + cw * 4] = np.frombuffer(cdata[src_off:src_off + cw * 4], dtype=np.uint8)
             else:
                 for row in range(ch):
                     src_off = row * cw * 4
                     dst_off = ((dy + row) * surfW + dx) * 4
                     if dst_off + cw * 4 <= len(surfBuf) and src_off + cw * 4 <= len(cdata):
-                        surfBuf[dst_off:dst_off + cw * 4] = cdata[src_off:src_off + cw * 4]
+                        surfBuf[dst_off:dst_off + cw * 4] = np.frombuffer(cdata[src_off:src_off + cw * 4], dtype=np.uint8)
 
             self._deliverBitmap(ox + dx, oy + dy, cw, ch, 32, bytes(cdata))
 
@@ -1725,7 +1727,8 @@ class DrdynvcLayer(LayerAutomata):
             src_off = (ry + row) * stride + rx * 4
             dst_off = row * row_bytes
             if src_off + row_bytes <= len(surfBuf):
-                region[dst_off:dst_off + row_bytes] = surfBuf[src_off:src_off + row_bytes]
+                row_data = surfBuf[src_off:src_off + row_bytes]
+                region[dst_off:dst_off + row_bytes] = row_data.tobytes() if isinstance(row_data, np.ndarray) else row_data
         return bytes(region)
 
     def _deliverBitmap(self, x, y, width, height, bpp, data):

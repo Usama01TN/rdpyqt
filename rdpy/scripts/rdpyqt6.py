@@ -121,7 +121,7 @@ class RDPClientQtFactory(rdp.ClientFactory):
         self._width = width
         self._height = height
         self._username = username
-        self._passwod = password
+        self._password = password
         self._domain = domain
         self._keyboardType = keyboardType
         self._keyboardLayout = keyboardLayout
@@ -160,7 +160,7 @@ class RDPClientQtFactory(rdp.ClientFactory):
         self._client.setResizeCallback(self._onResize)
         
         controller.setUsername(self._username)
-        controller.setPassword(self._passwod)
+        controller.setPassword(self._password)
         controller.setDomain(self._domain)
         controller.setKeyboardType(self._keyboardType)
         controller.setKeyboardLayout(self._keyboardLayout)
